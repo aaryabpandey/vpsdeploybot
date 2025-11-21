@@ -1,29 +1,48 @@
 # vps Deploy Bot commands 
 **Must have subscribed to AyuXD**
-**1st** 
+**1st Command** 
 ```
-apt update 
+sudo apt update
 ```
-**2st** 
+**2nd Command** 
 ```
-TKMC 
+sudo apt install git -y
 ```
-**1st** 
+**3rd Command** 
+```
+git clone https://github.com/Ayuxd-yt/vpsdeploybot
+```
+**4th Command** 
+```
+sudo apt install python3-pip -y
+```
+**5th Command** 
+```
+cd vpsdeploybot
+```
+**6th Command** 
 ```
 pip install -r requirements.txt
 ```
-**2nd** 
+**7th Command** 
 ```
 touch Dockerfile
 ```
-**3rd** 
+**8th Command** 
 ```
 docker build -t ubuntu-22.04-with-tmate .
 ```
-**4th** 
+**9th Command** 
+```
+nano bot.py
+```
+**add token!**
+**10th Command** 
 ```
 python3 bot.py
 ```
 **add token!**
 
+
+**Make sure to subscribe to Ayuxd and ifusing codesin video then give credit** 
 *you are done*
