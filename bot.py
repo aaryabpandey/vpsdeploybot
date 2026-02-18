@@ -1,2567 +1,2708 @@
-# Final Complete bot.py with all commands, manage buttons, SSH, share, renew, suspend, points, invites, giveaways
 import discord
-from discord import app_commands
-from discord.ext import commands, tasks
-import asyncio
-import subprocess
-import json
+from discord.ext import commands
+from discord import ui, app_commands
 import os
 import random
+import string
+import json
+import subprocess
+from dotenv import load_dotenv
+import asyncio
+import datetime
+import docker
+import time
 import logging
-from datetime import datetime, timedelta
+import traceback
+import aiohttp
+import socket
+import re
+import psutil
+import platform
+import shutil
+from typing import Optional, Literal
+import sqlite3
+import pickle
+import base64
+import threading
+from flask import Flask, render_template, request, jsonify, session
+from flask_socketio import SocketIO, emit
+import docker
+import paramiko
+import os
+from dotenv import load_dotenv
 
-# ---------------- CONFIG ----------------
-TOKEN = ""
-GUILD_ID = 1432390408184529084
-MAIN_ADMIN_IDS = {1397506807089598474}  # CHANGED: Renamed to MAIN_ADMIN_IDS
-SERVER_IP = "207.244.240.48"
-QR_IMAGE = ""
-IMAGE = "jrei/systemd-ubuntu:22.04"
-DEFAULT_RAM_GB = 32
-DEFAULT_CPU = 6
-DEFAULT_DISK_GB = 100
-DATA_DIR = "data"
-USERS_FILE = os.path.join(DATA_DIR, "users.json")
-VPS_FILE = os.path.join(DATA_DIR, "vps_db.json")
-INV_CACHE_FILE = os.path.join(DATA_DIR, "inv_cache.json")
-GIVEAWAY_FILE = os.path.join(DATA_DIR, "giveaways.json")
-POINTS_PER_DEPLOY = 6
-POINTS_RENEW_15 = 4
-POINTS_RENEW_30 = 8
-VPS_LIFETIME_DAYS = 15
-RENEW_MODE_FILE = os.path.join(DATA_DIR, "renew_mode.json")
-LOG_CHANNEL_ID = None
-OWNER_ID = 1397506807089598474
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('hostforge_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('HostForgeBot')
 
-# Global admin sets
-ADMIN_IDS = set(MAIN_ADMIN_IDS)  # This will contain ALL admins (main + additional)
+# Load environment variables
+load_dotenv()
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ChunkHostBot")
+# Bot configuration
+TOKEN = os.getenv('DISCORD_TOKEN')
+HOST_IP = os.getenv('HOST_IP')  # Optional, will fetch dynamically if not set
+ADMIN_IDS = {int(id_) for id_ in os.getenv('ADMIN_IDS', '1210291131301101618').split(',') if id_.strip()}
+ADMIN_ROLE_ID = int(os.getenv('ADMIN_ROLE_ID', '1376177459870961694'))
+WATERMARK = "HostForge VPS Service"
+WELCOME_MESSAGE = "Welcome To HostForge! Get Started With Us!"
+MAX_VPS_PER_USER = int(os.getenv('MAX_VPS_PER_USER', '3'))
+DEFAULT_OS_IMAGE = os.getenv('DEFAULT_OS_IMAGE', 'ubuntu:22.04')
+DOCKER_NETWORK = os.getenv('DOCKER_NETWORK', 'bridge')
+MAX_CONTAINERS = int(os.getenv('MAX_CONTAINERS', '100'))
+DB_FILE = 'hostforge.db'
+BACKUP_FILE = 'hostforge_backup.pkl'
+PORT_RANGE_START = 20000
+PORT_RANGE_END = 30000
 
-# Ensure data dir
-os.makedirs(DATA_DIR, exist_ok=True)
+# Known miner process names/patterns
+MINER_PATTERNS = [
+    'xmrig', 'ethminer', 'cgminer', 'sgminer', 'bfgminer',
+    'minerd', 'cpuminer', 'cryptonight', 'stratum', 'pool'
+]
 
-# JSON helpers
-def load_json(path, default):
-    try:
-        if not os.path.exists(path): return default
-        with open(path, 'r') as f: return json.load(f)
-    except: return default
+# Dockerfile template for custom images
+DOCKERFILE_TEMPLATE = """
+FROM {base_image}
 
-def save_json(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, 'w') as f: json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+# Prevent prompts
+ENV DEBIAN_FRONTEND=noninteractive
 
-users = load_json(USERS_FILE, {})
-vps_db = load_json(VPS_FILE, {})
-invite_snapshot = load_json(INV_CACHE_FILE, {})
-giveaways = load_json(GIVEAWAY_FILE, {})
-renew_mode = load_json(RENEW_MODE_FILE, {"mode": "15"})
+# Install systemd, sudo, SSH, Docker and other essential packages
+RUN apt-get update && \\
+    apt-get install -y systemd systemd-sysv dbus sudo \\
+                       curl gnupg2 apt-transport-https ca-certificates \\
+                       software-properties-common \\
+                       docker.io openssh-server tmate && \\
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-def is_unique_join(user_id, inviter_id):
-    """Check if this is a unique join (not a rejoin)"""
-    uid = str(inviter_id)
-    if uid not in users:
-        return True
-    
-    unique_joins = users[uid].get('unique_joins', [])
-    return str(user_id) not in unique_joins
+# Root password
+RUN echo "root:root" | chpasswd
 
-def add_unique_join(user_id, inviter_id):
-    """Add a unique join to inviter's record"""
-    uid = str(inviter_id)
-    if uid not in users:
-        users[uid] = {
-            "points": 0, 
-            "inv_unclaimed": 0, 
-            "inv_total": 0, 
-            "invites": [],
-            "unique_joins": []
+# Enable SSH login
+RUN mkdir /var/run/sshd && \\
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \\
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+# Enable services on boot
+RUN systemctl enable ssh && \\
+    systemctl enable docker
+
+# HostForge customization
+RUN echo '{welcome_message}' > /etc/motd && \\
+    echo 'echo "{welcome_message}"' >> /root/.bashrc && \\
+    echo '{watermark}' > /etc/machine-info && \\
+    echo 'hostforge-{vps_id}' > /etc/hostname
+
+# Install additional useful packages
+RUN apt-get update && \\
+    apt-get install -y neofetch htop nano vim wget git tmux net-tools dnsutils iputils-ping && \\
+    apt-get clean && \\
+    rm -rf /var/lib/apt/lists/*
+
+# Fix systemd inside container
+STOPSIGNAL SIGRTMIN+3
+
+# Boot into systemd (like a VM)
+CMD ["/sbin/init"]
+"""
+
+class Database:
+    """Handles all data persistence using SQLite3"""
+    def __init__(self, db_file):
+        self.conn = sqlite3.connect(db_file, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self._create_tables()
+        self._initialize_settings()
+
+    def _create_tables(self):
+        """Create necessary tables"""
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS vps_instances (
+                token TEXT PRIMARY KEY,
+                vps_id TEXT UNIQUE,
+                container_id TEXT,
+                memory INTEGER,
+                cpu INTEGER,
+                disk INTEGER,
+                username TEXT,
+                password TEXT,
+                root_password TEXT,
+                created_by TEXT,
+                created_at TEXT,
+                tmate_session TEXT,
+                watermark TEXT,
+                os_image TEXT,
+                restart_count INTEGER DEFAULT 0,
+                last_restart TEXT,
+                status TEXT DEFAULT 'running',
+                use_custom_image BOOLEAN DEFAULT 1,
+                external_ssh_port INTEGER
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS usage_stats (
+                key TEXT PRIMARY KEY,
+                value INTEGER DEFAULT 0
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id TEXT PRIMARY KEY
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS admin_users (
+                user_id TEXT PRIMARY KEY
+            )
+        ''')
+        
+        self.conn.commit()
+
+    def _initialize_settings(self):
+        """Initialize default settings"""
+        defaults = {
+            'max_containers': str(MAX_CONTAINERS),
+            'max_vps_per_user': str(MAX_VPS_PER_USER)
         }
-    
-    user_id_str = str(user_id)
-    if user_id_str not in users[uid].get('unique_joins', []):
-        users[uid]['unique_joins'].append(user_id_str)
-        users[uid]['inv_unclaimed'] += 1
-        users[uid]['inv_total'] += 1
-        persist_users()
-        return True
-    return False
-# ---------------- Bot Init ----------------
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-intents.members = True
-intents.invites = True
+        for key, value in defaults.items():
+            self.cursor.execute('INSERT OR IGNORE INTO system_settings (key, value) VALUES (?, ?)', (key, value))
+        
+        # Load admin users from database
+        self.cursor.execute('SELECT user_id FROM admin_users')
+        for row in self.cursor.fetchall():
+            ADMIN_IDS.add(int(row[0]))
+            
+        self.conn.commit()
 
-class Bot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)  # Changed prefix to !
+    def get_setting(self, key, default=None):
+        self.cursor.execute('SELECT value FROM system_settings WHERE key = ?', (key,))
+        result = self.cursor.fetchone()
+        return int(result[0]) if result else default
+
+    def set_setting(self, key, value):
+        self.cursor.execute('INSERT OR REPLACE INTO system_settings (key, value) VALUES (?, ?)', (key, str(value)))
+        self.conn.commit()
+
+    def get_stat(self, key, default=0):
+        self.cursor.execute('SELECT value FROM usage_stats WHERE key = ?', (key,))
+        result = self.cursor.fetchone()
+        return result[0] if result else default
+
+    def increment_stat(self, key, amount=1):
+        current = self.get_stat(key)
+        self.cursor.execute('INSERT OR REPLACE INTO usage_stats (key, value) VALUES (?, ?)', (key, current + amount))
+        self.conn.commit()
+
+    def get_vps_by_id(self, vps_id):
+        self.cursor.execute('SELECT * FROM vps_instances WHERE vps_id = ?', (vps_id,))
+        row = self.cursor.fetchone()
+        if not row:
+            return None, None
+        columns = [desc[0] for desc in self.cursor.description]
+        vps = dict(zip(columns, row))
+        return vps['token'], vps
+
+    def get_vps_by_token(self, token):
+        self.cursor.execute('SELECT * FROM vps_instances WHERE token = ?', (token,))
+        row = self.cursor.fetchone()
+        if not row:
+            return None
+        columns = [desc[0] for desc in self.cursor.description]
+        return dict(zip(columns, row))
+
+    def get_user_vps_count(self, user_id):
+        self.cursor.execute('SELECT COUNT(*) FROM vps_instances WHERE created_by = ?', (str(user_id),))
+        return self.cursor.fetchone()[0]
+
+    def get_user_vps(self, user_id):
+        self.cursor.execute('SELECT * FROM vps_instances WHERE created_by = ?', (str(user_id),))
+        columns = [desc[0] for desc in self.cursor.description]
+        return [dict(zip(columns, row)) for row in self.cursor.fetchall()]
+
+    def get_all_vps(self):
+        self.cursor.execute('SELECT * FROM vps_instances')
+        columns = [desc[0] for desc in self.cursor.description]
+        return {row[0]: dict(zip(columns, row)) for row in self.cursor.fetchall()}
+
+    def add_vps(self, vps_data):
+        columns = ', '.join(vps_data.keys())
+        placeholders = ', '.join('?' for _ in vps_data)
+        self.cursor.execute(f'INSERT INTO vps_instances ({columns}) VALUES ({placeholders})', tuple(vps_data.values()))
+        self.conn.commit()
+        self.increment_stat('total_vps_created')
+
+    def remove_vps(self, token):
+        self.cursor.execute('DELETE FROM vps_instances WHERE token = ?', (token,))
+        self.conn.commit()
+        return self.cursor.rowcount > 0
+
+    def update_vps(self, token, updates):
+        set_clause = ', '.join(f'{k} = ?' for k in updates)
+        values = list(updates.values()) + [token]
+        self.cursor.execute(f'UPDATE vps_instances SET {set_clause} WHERE token = ?', values)
+        self.conn.commit()
+        return self.cursor.rowcount > 0
+
+    def is_user_banned(self, user_id):
+        self.cursor.execute('SELECT 1 FROM banned_users WHERE user_id = ?', (str(user_id),))
+        return self.cursor.fetchone() is not None
+
+    def ban_user(self, user_id):
+        self.cursor.execute('INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)', (str(user_id),))
+        self.conn.commit()
+
+    def unban_user(self, user_id):
+        self.cursor.execute('DELETE FROM banned_users WHERE user_id = ?', (str(user_id),))
+        self.conn.commit()
+
+    def get_banned_users(self):
+        self.cursor.execute('SELECT user_id FROM banned_users')
+        return [row[0] for row in self.cursor.fetchall()]
+
+    def add_admin(self, user_id):
+        self.cursor.execute('INSERT OR IGNORE INTO admin_users (user_id) VALUES (?)', (str(user_id),))
+        self.conn.commit()
+        ADMIN_IDS.add(int(user_id))
+
+    def remove_admin(self, user_id):
+        self.cursor.execute('DELETE FROM admin_users WHERE user_id = ?', (str(user_id),))
+        self.conn.commit()
+        if int(user_id) in ADMIN_IDS:
+            ADMIN_IDS.remove(int(user_id))
+
+    def get_admins(self):
+        self.cursor.execute('SELECT user_id FROM admin_users')
+        return [row[0] for row in self.cursor.fetchall()]
+
+    def get_used_ports(self):
+        self.cursor.execute('SELECT external_ssh_port FROM vps_instances WHERE external_ssh_port IS NOT NULL')
+        return {row[0] for row in self.cursor.fetchall()}
+
+    def backup_data(self):
+        """Backup all data to a file"""
+        data = {
+            'vps_instances': self.get_all_vps(),
+            'usage_stats': {},
+            'system_settings': {},
+            'banned_users': self.get_banned_users(),
+            'admin_users': self.get_admins()
+        }
+        
+        # Get usage stats
+        self.cursor.execute('SELECT * FROM usage_stats')
+        for row in self.cursor.fetchall():
+            data['usage_stats'][row[0]] = row[1]
+            
+        # Get system settings
+        self.cursor.execute('SELECT * FROM system_settings')
+        for row in self.cursor.fetchall():
+            data['system_settings'][row[0]] = row[1]
+            
+        with open(BACKUP_FILE, 'wb') as f:
+            pickle.dump(data, f)
+            
+        return True
+
+    def restore_data(self):
+        """Restore data from backup file"""
+        if not os.path.exists(BACKUP_FILE):
+            return False
+            
+        try:
+            with open(BACKUP_FILE, 'rb') as f:
+                data = pickle.load(f)
+                
+            # Clear all tables
+            self.cursor.execute('DELETE FROM vps_instances')
+            self.cursor.execute('DELETE FROM usage_stats')
+            self.cursor.execute('DELETE FROM system_settings')
+            self.cursor.execute('DELETE FROM banned_users')
+            self.cursor.execute('DELETE FROM admin_users')
+            
+            # Restore VPS instances
+            for token, vps in data['vps_instances'].items():
+                columns = ', '.join(vps.keys())
+                placeholders = ', '.join('?' for _ in vps)
+                self.cursor.execute(f'INSERT INTO vps_instances ({columns}) VALUES ({placeholders})', tuple(vps.values()))
+            
+            # Restore usage stats
+            for key, value in data['usage_stats'].items():
+                self.cursor.execute('INSERT INTO usage_stats (key, value) VALUES (?, ?)', (key, value))
+                
+            # Restore system settings
+            for key, value in data['system_settings'].items():
+                self.cursor.execute('INSERT INTO system_settings (key, value) VALUES (?, ?)', (key, value))
+                
+            # Restore banned users
+            for user_id in data['banned_users']:
+                self.cursor.execute('INSERT INTO banned_users (user_id) VALUES (?)', (user_id,))
+                
+            # Restore admin users
+            for user_id in data['admin_users']:
+                self.cursor.execute('INSERT INTO admin_users (user_id) VALUES (?)', (user_id,))
+                ADMIN_IDS.add(int(user_id))
+                
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error restoring data: {e}")
+            return False
+
+    def close(self):
+        self.conn.close()
+
+# Initialize bot with command prefix '/'
+class HostForgeBot(commands.Bot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.db = Database(DB_FILE)
+        self.session = None
+        self.docker_client = None
+        self.public_ip = None
+        self.system_stats = {
+            'cpu_usage': 0,
+            'memory_usage': 0,
+            'disk_usage': 0,
+            'network_io': (0, 0),
+            'last_updated': 0
+        }
+        self.my_persistent_views = {}
 
     async def setup_hook(self):
-        # Sync commands globally
+        self.session = aiohttp.ClientSession()
         try:
-            synced = await self.tree.sync()
-            logger.info(f"Synced {len(synced)} command(s)")
+            self.docker_client = docker.from_env()
+            logger.info("Docker client initialized successfully")
+            self.public_ip = HOST_IP or await self.get_public_ip()
+            logger.info(f"Public IP: {self.public_ip}")
+            self.loop.create_task(self.update_system_stats())
+            self.loop.create_task(self.anti_miner_monitor())
+            # Reconnect to existing containers
+            await self.reconnect_containers()
+            # Restore persistent views
+            await self.restore_persistent_views()
         except Exception as e:
-            logger.error(f"Failed to sync commands: {e}")
+            logger.error(f"Failed to initialize Docker client: {e}")
+            self.docker_client = None
 
-bot = Bot()
+    async def get_public_ip(self):
+        try:
+            async with self.session.get('https://api.ipify.org') as resp:
+                if resp.status == 200:
+                    return await resp.text()
+                else:
+                    logger.error(f"Failed to get public IP: {resp.status}")
+                    return '127.0.0.1'  # Fallback
+        except Exception as e:
+            logger.error(f"Error getting public IP: {e}")
+            return '127.0.0.1'
 
-# ---------------- Docker Helpers ----------------
-async def docker_run_container(ram_gb, cpu, disk_gb):
-    http_port = random.randint(3000,3999)
-    name = f"vps-{random.randint(1000,9999)}"
-    
-    # FIXED: Use systemd-compatible container setup with proper image
-    cmd = [
-        "docker", "run", "-d", 
-        "--privileged",
-        "--cgroupns=host",
-        "--tmpfs", "/run",
-        "--tmpfs", "/run/lock",
-        "-v", "/sys/fs/cgroup:/sys/fs/cgroup:rw",
-        "--name", name,
-        "--cpus", str(cpu),
-        "--memory", f"{ram_gb}g",
-        "--memory-swap", f"{ram_gb}g",
-        "-p", f"{http_port}:80",
-        IMAGE  # Uses systemd-enabled image that has /sbin/init
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, err = await proc.communicate()
-        if proc.returncode != 0: 
-            return None, None, f"Container creation failed: {err.decode().strip() if err else 'Unknown error'}"
-        
-        container_id = out.decode().strip()[:12] if out else None
-        if not container_id:
-            return None, None, "Failed to get container ID"
-            
-        return container_id, http_port, None
-    except Exception as e:
-        return None, None, f"Container run exception: {str(e)}"
-
-async def setup_vps_environment(container_id):
-    try:
-        # Wait for systemd to start
-        await asyncio.sleep(15)
-        
-        # Update and install essentials
-        commands = [
-            "apt-get update -y",
-            "apt-get install -y tmate curl wget neofetch sudo nano htop",
-            "systemctl enable systemd-user-sessions",
-            "systemctl start systemd-user-sessions"
-        ]
-        
-        for cmd in commands:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "docker", "exec", container_id, "bash", "-c", cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                await asyncio.wait_for(proc.communicate(), timeout=120)
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout on command: {cmd}")
-                continue
-            except Exception as e:
-                logger.warning(f"Command failed {cmd}: {e}")
-                continue
-        
-        # Test systemctl
-        test_proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", container_id, "systemctl", "--version",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        await test_proc.communicate()
-        
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-async def docker_exec_capture_ssh(container_id):
-    try:
-        # Kill any existing tmate sessions
-        kill_cmd = "pkill -f tmate || true"
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", container_id, "bash", "-c", kill_cmd,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        await proc.communicate()
-        
-        # Generate SSH session using tmate
-        sock = f"/tmp/tmate-{container_id}.sock"
-        ssh_cmd = f"tmate -S {sock} new-session -d && sleep 5 && tmate -S {sock} display -p '#{{tmate_ssh}}'"
-        
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", container_id, "bash", "-c", ssh_cmd,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        
-        ssh_out = stdout.decode().strip() if stdout else "ssh@tmate.io"
-        
-        return ssh_out, None
-        
-    except Exception as e:
-        return "ssh@tmate.io", str(e)
-
-async def docker_stop_container(container_id):
-    try:
-        proc = await asyncio.create_subprocess_exec("docker", "stop", container_id)
-        await proc.communicate()
-        return True
-    except:
-        return False
-
-async def docker_start_container(container_id):
-    try:
-        proc = await asyncio.create_subprocess_exec("docker", "start", container_id)
-        await proc.communicate()
-        return True
-    except:
-        return False
-
-async def docker_restart_container(container_id):
-    try:
-        proc = await asyncio.create_subprocess_exec("docker", "restart", container_id)
-        await proc.communicate()
-        return True
-    except:
-        return False
-
-async def docker_remove_container(container_id):
-    try:
-        proc = await asyncio.create_subprocess_exec("docker", "rm", "-f", container_id)
-        await proc.communicate()
-        return True
-    except:
-        return False
-
-async def add_port_to_container(container_id, port):
-    try:
-        # Get container details to check if it exists
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "inspect", container_id,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        
-        if proc.returncode != 0:
-            return False, "Container not found"
-        
-        # For simplicity, we'll just note the port in our database
-        # In production, you'd need to recreate the container with new port mappings
-        return True, f"Port {port} mapped to container"
-    except Exception as e:
-        return False, str(e)
-
-async def check_systemctl_status(container_id):
-    """Check if systemctl works in the container"""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", container_id, "systemctl", "--version",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        return proc.returncode == 0
-    except:
-        return False
-
-# ---------------- VPS Helpers ----------------
-def persist_vps(): save_json(VPS_FILE, vps_db)
-def persist_users(): save_json(USERS_FILE, users)
-def persist_renew_mode(): save_json(RENEW_MODE_FILE, renew_mode)
-def persist_giveaways(): save_json(GIVEAWAY_FILE, giveaways)
-
-async def send_log(action: str, user, details: str = "", vps_id: str = ""):
-    """Send professional log embed to log channel"""
-    if not LOG_CHANNEL_ID:
-        return
-    
-    try:
-        channel = bot.get_channel(LOG_CHANNEL_ID)
-        if not channel:
-            print(f"Log channel {LOG_CHANNEL_ID} not found")
+    async def reconnect_containers(self):
+        """Reconnect to existing containers on startup"""
+        if not self.docker_client:
             return
-        
-        # Determine color based on action type
-        color_map = {
-            "deploy": discord.Color.green(),
-            "remove": discord.Color.orange(),
-            "renew": discord.Color.blue(),
-            "suspend": discord.Color.red(),
-            "unsuspend": discord.Color.green(),
-            "start": discord.Color.green(),
-            "stop": discord.Color.orange(),
-            "restart": discord.Color.blue(),
-            "share": discord.Color.purple(),
-            "admin": discord.Color.gold(),
-            "points": discord.Color.teal(),
-            "invite": discord.Color.magenta(),
-            "error": discord.Color.red()
-        }
-        
-        # Get appropriate color
-        action_lower = action.lower()
-        color = discord.Color.blue()  # default
-        for key, value in color_map.items():
-            if key in action_lower:
-                color = value
-                break
-        
-        # Create embed
-        embed = discord.Embed(
-            title=f"📊 {action}",
-            color=color,
-            timestamp=datetime.utcnow()
-        )
-        
-        # Add user info
-        if hasattr(user, 'mention'):
-            embed.add_field(name="👤 User", value=f"{user.mention}\n`{user.name}`", inline=True)
-        else:
-            embed.add_field(name="👤 User", value=f"`{user}`", inline=True)
-        
-        # Add VPS ID if provided
-        if vps_id:
-            embed.add_field(name="🆔 VPS ID", value=f"`{vps_id}`", inline=True)
-        
-        # Add details
-        if details:
-            embed.add_field(name="📝 Details", value=details[:1024], inline=False)
-        
-        # Add timestamp field
-        embed.add_field(
-            name="⏰ Time", 
-            value=f"<t:{int(datetime.utcnow().timestamp())}:R>", 
-            inline=True
-        )
-        
-        # Set footer
-        embed.set_footer(text="VPS Activity Log")
-        
-        await channel.send(embed=embed)
-        
-        # Also save to JSON file for /logs command
-        logs_file = os.path.join(DATA_DIR, "vps_logs.json")
-        logs_data = load_json(logs_file, [])
-        
-        log_entry = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "action": action,
-            "user": user.name if hasattr(user, 'name') else str(user),
-            "details": details,
-            "vps_id": vps_id
-        }
-        
-        logs_data.append(log_entry)
-        
-        # Keep only last 1000 logs to prevent file from growing too large
-        if len(logs_data) > 1000:
-            logs_data = logs_data[-1000:]
-        
-        save_json(logs_file, logs_data)
-        
-    except Exception as e:
-        print(f"Failed to send log: {e}")
+            
+        for token, vps in list(self.db.get_all_vps().items()):
+            if vps['status'] == 'running':
+                try:
+                    container = self.docker_client.containers.get(vps['container_id'])
+                    if container.status != 'running':
+                        container.start()
+                    logger.info(f"Reconnected and started container for VPS {vps['vps_id']}")
+                except docker.errors.NotFound:
+                    logger.warning(f"Container {vps['container_id']} not found, removing from data")
+                    self.db.remove_vps(token)
+                except Exception as e:
+                    logger.error(f"Error reconnecting container {vps['vps_id']}: {e}")
 
-async def create_vps(owner_id, ram=DEFAULT_RAM_GB, cpu=DEFAULT_CPU, disk=DEFAULT_DISK_GB, paid=False, giveaway=False):
-    uid = str(owner_id)
-    cid, http_port, err = await docker_run_container(ram, cpu, disk)
-    if err: 
-        return {'error': err}
-    
-    # Wait for container to start and setup
-    await asyncio.sleep(10)
-    
-    # Setup environment
-    success, setup_err = await setup_vps_environment(cid)
-    if not success:
-        logger.warning(f"Setup had issues for {cid}: {setup_err}")
-    
-    # Generate SSH
-    ssh, ssh_err = await docker_exec_capture_ssh(cid)
-    
-    # Check systemctl status
-    systemctl_works = await check_systemctl_status(cid)
-    
-    created = datetime.utcnow()
-    expires = created + timedelta(days=VPS_LIFETIME_DAYS)
-    rec = {
-        "owner": uid,
-        "container_id": cid,
-        "ram": ram,
-        "cpu": cpu,
-        "disk": disk,
-        "http_port": http_port,
-        "ssh": ssh,
-        "created_at": created.isoformat(),
-        "expires_at": expires.isoformat(),
-        "active": True,
-        "suspended": False,
-        "paid_plan": paid,
-        "giveaway_vps": giveaway,
-        "shared_with": [],
-        "additional_ports": [],
-        "systemctl_working": systemctl_works
-    }
-    vps_db[cid] = rec
-    persist_vps()
-    
-    # Send log
-    try:
-        user = await bot.fetch_user(int(uid))
-        await send_log("VPS Created", user, cid, f"RAM: {ram}GB, CPU: {cpu}, Disk: {disk}GB, Systemctl: {'✅' if systemctl_works else '❌'}")
-    except:
+    async def restore_persistent_views(self):
+        """Restore persistent views after restart"""
+        # This would be implemented to restore any persistent UI components
         pass
-    
-    return rec
 
-def get_user_vps(user_id):
-    uid = str(user_id)
-    return [vps for vps in vps_db.values() if vps['owner'] == uid or uid in vps.get('shared_with', [])]
-
-def can_manage_vps(user_id, container_id):
-    if user_id in ADMIN_IDS:
-        return True
-    vps = vps_db.get(container_id)
-    if not vps:
-        return False
-    uid = str(user_id)
-    return vps['owner'] == uid or uid in vps.get('shared_with', [])
-
-def get_resource_usage():
-    """Calculate resource usage percentages"""
-    total_ram = sum(vps['ram'] for vps in vps_db.values())
-    total_cpu = sum(vps['cpu'] for vps in vps_db.values())
-    total_disk = sum(vps['disk'] for vps in vps_db.values())
-    
-    ram_percent = (total_ram / (DEFAULT_RAM_GB * 100)) * 100  # Assuming 100GB max RAM
-    cpu_percent = (total_cpu / (DEFAULT_CPU * 50)) * 100     # Assuming 50 CPU max
-    disk_percent = (total_disk / (DEFAULT_DISK_GB * 200)) * 100  # Assuming 200GB max disk
-    
-    return {
-        'ram': min(ram_percent, 100),
-        'cpu': min(cpu_percent, 100),
-        'disk': min(disk_percent, 100),
-        'total_ram': total_ram,
-        'total_cpu': total_cpu,
-        'total_disk': total_disk
-    }
-
-# ---------------- Background Tasks ----------------
-@tasks.loop(minutes=10)
-async def expire_check_loop():
-    now = datetime.utcnow()
-    changed = False
-    for cid, rec in list(vps_db.items()):
-        if rec.get('active', True) and now >= datetime.fromisoformat(rec['expires_at']):
-            await docker_stop_container(cid)
-            rec['active'] = False
-            rec['suspended'] = True
-            changed = True
-            # Log expiration
+    async def anti_miner_monitor(self):
+        """Periodically check for mining activities"""
+        await self.wait_until_ready()
+        while not self.is_closed():
             try:
-                user = await bot.fetch_user(int(rec['owner']))
-                await send_log("VPS Expired", user, cid, "Auto-suspended due to expiry")
-            except:
-                pass
-    if changed: 
-        persist_vps()
-
-@tasks.loop(minutes=5)
-async def giveaway_check_loop():
-    now = datetime.utcnow()
-    ended_giveaways = []
-    
-    for giveaway_id, giveaway in list(giveaways.items()):
-        if giveaway['status'] == 'active' and now >= datetime.fromisoformat(giveaway['end_time']):
-            # Giveaway ended, select winner
-            participants = giveaway.get('participants', [])
-            if participants:
-                if giveaway['winner_type'] == 'random':
-                    winner_id = random.choice(participants)
-                    giveaway['winner_id'] = winner_id
-                    giveaway['status'] = 'ended'
-                    
-                    # Create VPS for winner
+                for token, vps in self.db.get_all_vps().items():
+                    if vps['status'] != 'running':
+                        continue
                     try:
-                        rec = await create_vps(int(winner_id), giveaway['vps_ram'], giveaway['vps_cpu'], giveaway['vps_disk'], giveaway_vps=True)
-                        if 'error' not in rec:
-                            giveaway['vps_created'] = True
-                            giveaway['winner_vps_id'] = rec['container_id']
-                            
-                            # Send DM to winner
-                            try:
-                                winner = await bot.fetch_user(int(winner_id))
-                                embed = discord.Embed(title="🎉 You Won a VPS Giveaway!", color=discord.Color.gold())
-                                embed.add_field(name="Container ID", value=f"`{rec['container_id']}`", inline=False)
-                                embed.add_field(name="Specs", value=f"**{rec['ram']}GB RAM** | **{rec['cpu']} CPU** | **{rec['disk']}GB Disk**", inline=False)
-                                embed.add_field(name="Expires", value=rec['expires_at'][:10], inline=True)
-                                embed.add_field(name="Status", value="🟢 Active", inline=True)
-                                embed.add_field(name="HTTP Access", value=f"http://{SERVER_IP}:{rec['http_port']}", inline=False)
-                                embed.add_field(name="SSH Connection", value=f"```{rec['ssh']}```", inline=False)
-                                embed.set_footer(text="This is a giveaway VPS and cannot be renewed. It will auto-delete after 15 days.")
-                                await winner.send(embed=embed)
-                            except:
-                                pass
-                    except Exception as e:
-                        logger.error(f"Failed to create VPS for giveaway winner: {e}")
-                
-                elif giveaway['winner_type'] == 'all':
-                    # Create VPS for all participants
-                    successful_creations = 0
-                    for participant_id in participants:
-                        try:
-                            rec = await create_vps(int(participant_id), giveaway['vps_ram'], giveaway['vps_cpu'], giveaway['vps_disk'], giveaway_vps=True)
-                            if 'error' not in rec:
-                                successful_creations += 1
-                                
-                                # Send DM to participant
+                        container = self.docker_client.containers.get(vps['container_id'])
+                        if container.status != 'running':
+                            continue
+                        
+                        # Check processes
+                        exec_result = container.exec_run("ps aux")
+                        output = exec_result.output.decode().lower()
+                        
+                        for pattern in MINER_PATTERNS:
+                            if pattern in output:
+                                logger.warning(f"Mining detected in VPS {vps['vps_id']}, suspending...")
+                                container.stop()
+                                self.db.update_vps(token, {'status': 'suspended'})
+                                # Notify owner
                                 try:
-                                    participant = await bot.fetch_user(int(participant_id))
-                                    embed = discord.Embed(title="🎉 You Received a VPS from Giveaway!", color=discord.Color.gold())
-                                    embed.add_field(name="Container ID", value=f"`{rec['container_id']}`", inline=False)
-                                    embed.add_field(name="Specs", value=f"**{rec['ram']}GB RAM** | **{rec['cpu']} CPU** | **{rec['disk']}GB Disk**", inline=False)
-                                    embed.add_field(name="Expires", value=rec['expires_at'][:10], inline=True)
-                                    embed.add_field(name="Status", value="🟢 Active", inline=True)
-                                    embed.add_field(name="HTTP Access", value=f"http://{SERVER_IP}:{rec['http_port']}", inline=False)
-                                    embed.add_field(name="SSH Connection", value=f"```{rec['ssh']}```", inline=False)
-                                    embed.set_footer(text="This is a giveaway VPS and cannot be renewed. It will auto-delete after 15 days.")
-                                    await participant.send(embed=embed)
+                                    owner = await self.fetch_user(int(vps['created_by']))
+                                    await owner.send(f"⚠️ Your VPS {vps['vps_id']} has been suspended due to detected mining activity. Contact admin to unsuspend.")
                                 except:
                                     pass
-                        except Exception as e:
-                            logger.error(f"Failed to create VPS for giveaway participant: {e}")
-                    
-                    giveaway['vps_created'] = True
-                    giveaway['successful_creations'] = successful_creations
-                    giveaway['status'] = 'ended'
-            
-            else:
-                # No participants
-                giveaway['status'] = 'ended'
-                giveaway['no_participants'] = True
-            
-            ended_giveaways.append(giveaway_id)
-    
-    if ended_giveaways:
-        persist_giveaways()
+                                break
+                    except Exception as e:
+                        logger.error(f"Error checking VPS {vps['vps_id']} for mining: {e}")
+            except Exception as e:
+                logger.error(f"Error in anti_miner_monitor: {e}")
+            await asyncio.sleep(300)  # Check every 5 minutes
 
-# ---------------- Bot Events ----------------
+    async def update_system_stats(self):
+        """Update system statistics periodically"""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                # CPU usage
+                cpu_percent = psutil.cpu_percent(interval=1)
+                
+                # Memory usage
+                mem = psutil.virtual_memory()
+                
+                # Disk usage
+                disk = psutil.disk_usage('/')
+                
+                # Network IO
+                net_io = psutil.net_io_counters()
+                
+                self.system_stats = {
+                    'cpu_usage': cpu_percent,
+                    'memory_usage': mem.percent,
+                    'memory_used': mem.used / (1024 ** 3),  # GB
+                    'memory_total': mem.total / (1024 ** 3),  # GB
+                    'disk_usage': disk.percent,
+                    'disk_used': disk.used / (1024 ** 3),  # GB
+                    'disk_total': disk.total / (1024 ** 3),  # GB
+                    'network_sent': net_io.bytes_sent / (1024 ** 2),  # MB
+                    'network_recv': net_io.bytes_recv / (1024 ** 2),  # MB
+                    'last_updated': time.time()
+                }
+            except Exception as e:
+                logger.error(f"Error updating system stats: {e}")
+            await asyncio.sleep(30)
+
+    async def close(self):
+        await super().close()
+        if self.session:
+            await self.session.close()
+        if self.docker_client:
+            self.docker_client.close()
+        self.db.close()
+
+def generate_token():
+    """Generate a random token for VPS access"""
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=24))
+
+def generate_vps_id():
+    """Generate a unique VPS ID"""
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+
+def get_available_port(db):
+    """Get an available random port for SSH forwarding"""
+    used_ports = db.get_used_ports()
+    while True:
+        port = random.randint(PORT_RANGE_START, PORT_RANGE_END)
+        if port not in used_ports:
+            return port
+
+async def capture_ssh_session_line(process):
+    """Capture the SSH session line from tmate output"""
+    try:
+        while True:
+            output = await process.stdout.readline()
+            if not output:
+                break
+            output = output.decode('utf-8').strip()
+            if "ssh session:" in output:
+                return output.split("ssh session:")[1].strip()
+        return None
+    except Exception as e:
+        logger.error(f"Error capturing SSH session: {e}")
+        return None
+
+async def run_docker_command(container_id, command, timeout=120):
+    """Run a Docker command asynchronously with timeout"""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "docker", "exec", container_id, *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            if process.returncode != 0:
+                raise Exception(f"Command failed: {stderr.decode()}")
+            return True, stdout.decode()
+        except asyncio.TimeoutError:
+            process.kill()
+            raise Exception(f"Command timed out after {timeout} seconds")
+    except Exception as e:
+        logger.error(f"Error running Docker command: {e}")
+        return False, str(e)
+
+async def kill_apt_processes(container_id):
+    """Kill any running apt processes"""
+    try:
+        success, _ = await run_docker_command(container_id, ["bash", "-c", "killall apt apt-get dpkg || true"])
+        await asyncio.sleep(2)
+        success, _ = await run_docker_command(container_id, ["bash", "-c", "rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock*"])
+        await asyncio.sleep(2)
+        return success
+    except Exception as e:
+        logger.error(f"Error killing apt processes: {e}")
+        return False
+
+async def wait_for_apt_lock(container_id, status_msg):
+    """Wait for apt lock to be released"""
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            await kill_apt_processes(container_id)
+            
+            process = await asyncio.create_subprocess_exec(
+                "docker", "exec", container_id, "bash", "-c", "lsof /var/lib/dpkg/lock-frontend",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                return True
+                
+            if isinstance(status_msg, discord.Interaction):
+                await status_msg.followup.send(f"🔄 Waiting for package manager to be ready... (Attempt {attempt + 1}/{max_attempts})", ephemeral=True)
+            else:
+                await status_msg.edit(content=f"🔄 Waiting for package manager to be ready... (Attempt {attempt + 1}/{max_attempts})")
+            await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"Error checking apt lock: {e}")
+            await asyncio.sleep(5)
+    
+    return False
+
+async def build_custom_image(vps_id, base_image=DEFAULT_OS_IMAGE):
+    """Build a custom Docker image using our template"""
+    try:
+        # Create a temporary directory for the Dockerfile
+        temp_dir = f"temp_dockerfiles/{vps_id}"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Generate Dockerfile content
+        dockerfile_content = DOCKERFILE_TEMPLATE.format(
+            base_image=base_image,
+            welcome_message=WELCOME_MESSAGE,
+            watermark=WATERMARK,
+            vps_id=vps_id
+        )
+        
+        # Write Dockerfile
+        dockerfile_path = os.path.join(temp_dir, "Dockerfile")
+        with open(dockerfile_path, 'w') as f:
+            f.write(dockerfile_content)
+        
+        # Build the image
+        image_tag = f"hostforge/{vps_id.lower()}:latest"
+        build_process = await asyncio.create_subprocess_exec(
+            "docker", "build", "-t", image_tag, temp_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await build_process.communicate()
+        
+        if build_process.returncode != 0:
+            raise Exception(f"Failed to build image: {stderr.decode()}")
+        
+        return image_tag
+    except Exception as e:
+        logger.error(f"Error building custom image: {e}")
+        raise
+    finally:
+        # Clean up temporary directory
+        try:
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+        except Exception as e:
+            logger.error(f"Error cleaning up temp directory: {e}")
+
+async def setup_container(container_id, status_msg, memory, vps_id=None, use_custom_image=False):
+    """Enhanced container setup with HostForge customization"""
+    try:
+        # Ensure container is running
+        if isinstance(status_msg, discord.Interaction):
+            await status_msg.followup.send("🔍 Checking container status...", ephemeral=True)
+        else:
+            await status_msg.edit(content="🔍 Checking container status...")
+            
+        container = bot.docker_client.containers.get(container_id)
+        if container.status != "running":
+            if isinstance(status_msg, discord.Interaction):
+                await status_msg.followup.send("🚀 Starting container...", ephemeral=True)
+            else:
+                await status_msg.edit(content="🚀 Starting container...")
+            container.start()
+            await asyncio.sleep(5)
+
+        # Install tmate and other required packages if not custom
+        if not use_custom_image:
+            if isinstance(status_msg, discord.Interaction):
+                await status_msg.followup.send("📦 Installing required packages...", ephemeral=True)
+            else:
+                await status_msg.edit(content="📦 Installing required packages...")
+                
+            # Update package list
+            success, output = await run_docker_command(container_id, ["apt-get", "update"])
+            if not success:
+                raise Exception(f"Failed to update package list: {output}")
+
+            # Install packages
+            packages = [
+                "tmate", "neofetch", "screen", "wget", "curl", "htop", "nano", "vim", 
+                "openssh-server", "sudo", "ufw", "git", "docker.io", "systemd", "systemd-sysv"
+            ]
+            success, output = await run_docker_command(container_id, ["apt-get", "install", "-y"] + packages)
+            if not success:
+                raise Exception(f"Failed to install packages: {output}")
+
+        # Setup SSH
+        if isinstance(status_msg, discord.Interaction):
+            await status_msg.followup.send("🔐 Configuring SSH access...", ephemeral=True)
+        else:
+            await status_msg.edit(content="🔐 Configuring SSH access...")
+            
+        # For non-custom image, setup root
+        if not use_custom_image:
+            setup_commands = [
+                'echo "root:root" | chpasswd',
+                "sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config",
+                "sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config",
+                "service ssh restart"
+            ]
+            
+            for cmd in setup_commands:
+                success, output = await run_docker_command(container_id, ["bash", "-c", cmd])
+                if not success:
+                    raise Exception(f"Failed to setup SSH: {output}")
+
+        # Set HostForge customization
+        if isinstance(status_msg, discord.Interaction):
+            await status_msg.followup.send("🎨 Setting up HostForge customization...", ephemeral=True)
+        else:
+            await status_msg.edit(content="🎨 Setting up HostForge customization...")
+            
+        # Create welcome message file
+        welcome_cmd = f"echo '{WELCOME_MESSAGE}' > /etc/motd && echo 'echo \"{WELCOME_MESSAGE}\"' >> /root/.bashrc"
+        success, output = await run_docker_command(container_id, ["bash", "-c", welcome_cmd])
+        if not success:
+            logger.warning(f"Could not set welcome message: {output}")
+
+        # Set hostname and watermark
+        if not vps_id:
+            vps_id = generate_vps_id()
+        hostname_cmd = f"echo 'hostforge-{vps_id}' > /etc/hostname && hostname hostforge-{vps_id}"
+        success, output = await run_docker_command(container_id, ["bash", "-c", hostname_cmd])
+        if not success:
+            raise Exception(f"Failed to set hostname: {output}")
+
+        # Set memory limit in cgroup
+        if isinstance(status_msg, discord.Interaction):
+            await status_msg.followup.send("⚙️ Setting resource limits...", ephemeral=True)
+        else:
+            await status_msg.edit(content="⚙️ Setting resource limits...")
+            
+        memory_bytes = memory * 1024 * 1024 * 1024
+        success, output = await run_docker_command(container_id, ["bash", "-c", f"echo {memory_bytes} > /sys/fs/cgroup/memory.max"])
+        if not success:
+            logger.warning(f"Could not set memory limit in cgroup: {output}")
+
+        # Set watermark in machine info
+        success, output = await run_docker_command(container_id, ["bash", "-c", f"echo '{WATERMARK}' > /etc/machine-info"])
+        if not success:
+            logger.warning(f"Could not set machine info: {output}")
+
+        # Basic security setup
+        security_commands = [
+            "ufw allow ssh",
+            "ufw --force enable",
+            "apt-get -y autoremove",
+            "apt-get clean"
+        ]
+        
+        for cmd in security_commands:
+            success, output = await run_docker_command(container_id, ["bash", "-c", cmd])
+            if not success:
+                logger.warning(f"Security setup command failed: {cmd} - {output}")
+
+        if isinstance(status_msg, discord.Interaction):
+            await status_msg.followup.send("✅ HostForge VPS setup completed successfully!", ephemeral=True)
+        else:
+            await status_msg.edit(content="✅ HostForge VPS setup completed successfully!")
+            
+        return True, vps_id
+    except Exception as e:
+        error_msg = f"Setup failed: {str(e)}"
+        logger.error(error_msg)
+        if isinstance(status_msg, discord.Interaction):
+            await status_msg.followup.send(f"❌ {error_msg}", ephemeral=True)
+        else:
+            await status_msg.edit(content=f"❌ {error_msg}")
+        return False, None
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = HostForgeBot(command_prefix='/', intents=intents, help_command=None)
+
 @bot.event
 async def on_ready():
-    logger.info(f"Bot ready: {bot.user} (ID: {bot.user.id})")
-    logger.info(f"Connected to {len(bot.guilds)} guilds")
-    expire_check_loop.start()
-    giveaway_check_loop.start()
+    logger.info(f'{bot.user} has connected to Discord!')
+    
+    # Auto-start VPS containers based on status
+    if bot.docker_client:
+        for token, vps in bot.db.get_all_vps().items():
+            if vps['status'] == 'running':
+                try:
+                    container = bot.docker_client.containers.get(vps["container_id"])
+                    if container.status != "running":
+                        container.start()
+                        logger.info(f"Started container for VPS {vps['vps_id']}")
+                except docker.errors.NotFound:
+                    logger.warning(f"Container {vps['container_id']} not found")
+                except Exception as e:
+                    logger.error(f"Error starting container: {e}")
+    
+    try:
+        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="HostForge VPS"))
+        synced_commands = await bot.tree.sync()
+        logger.info(f"Synced {len(synced_commands)} slash commands")
+    except Exception as e:
+        logger.error(f"Error syncing slash commands: {e}")
 
-@bot.event
-async def on_message(message):
-    # Auto-response for pterodactyl installation help
-    if message.author.bot:
+@bot.hybrid_command(name='help', description='Show all available commands')
+async def show_commands(ctx):
+    """Show all available commands"""
+    try:
+        embed = discord.Embed(title="🤖 HostForge VPS Bot Commands", color=discord.Color.blue())
+        
+        # User commands
+        embed.add_field(name="User Commands", value="""
+`/create_vps` - Create a new VPS (Admin only)
+`/connect_vps <token>` - Connect to your VPS
+`/list` - List all your VPS instances
+`/help` - Show this help message
+`/manage_vps <vps_id>` - Manage your VPS
+`/transfer_vps <vps_id> <user>` - Transfer VPS ownership
+`/vps_stats <vps_id>` - Show VPS resource usage
+`/change_ssh_password <vps_id>` - Change SSH password
+`/vps_shell <vps_id>` - Get shell access to your VPS
+`/vps_console <vps_id>` - Get direct console access to your VPS
+`/vps_usage` - Show your VPS usage statistics
+`/run_command <vps_id> <command>` - Run a command in your VPS
+""", inline=False)
+        
+        # Admin commands
+        if has_admin_role(ctx):
+            embed.add_field(name="Admin Commands", value="""
+`/vps_list` - List all VPS instances
+`/delete_vps <vps_id>` - Delete a VPS
+`/admin_stats` - Show system statistics
+`/cleanup_vps` - Cleanup inactive VPS instances
+`/add_admin <user>` - Add a new admin
+`/remove_admin <user>` - Remove an admin (Owner only)
+`/list_admins` - List all admin users
+`/system_info` - Show detailed system information
+`/container_limit <max>` - Set maximum container limit
+`/global_stats` - Show global usage statistics
+`/migrate_vps <vps_id>` - Migrate VPS to another host
+`/emergency_stop <vps_id>` - Force stop a problematic VPS
+`/emergency_remove <vps_id>` - Force remove a problematic VPS
+`/suspend_vps <vps_id>` - Suspend a VPS
+`/unsuspend_vps <vps_id>` - Unsuspend a VPS
+`/edit_vps <vps_id> <memory> <cpu> <disk>` - Edit VPS specifications
+`/ban_user <user>` - Ban a user from creating VPS
+`/unban_user <user>` - Unban a user
+`/list_banned` - List banned users
+`/backup_data` - Backup all data
+`/restore_data` - Restore from backup
+`/reinstall_bot` - Reinstall the bot (Owner only)
+""", inline=False)
+        
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Error in show_commands: {e}")
+        await ctx.send("❌ An error occurred while processing your request.")
+
+def has_admin_role(ctx):
+    """Check if user has admin role or is in ADMIN_IDS"""
+    if isinstance(ctx, discord.Interaction):
+        user_id = ctx.user.id
+        roles = ctx.user.roles
+    else:
+        user_id = ctx.author.id
+        roles = ctx.author.roles
+    
+    if user_id in ADMIN_IDS:
+        return True
+    
+    return any(role.id == ADMIN_ROLE_ID for role in roles)
+
+@bot.hybrid_command(name='add_admin', description='Add a new admin (Admin only)')
+@app_commands.describe(
+    user="User to make admin"
+)
+async def add_admin(ctx, user: discord.User):
+    """Add a new admin user"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
         return
     
-    content = message.content.lower()
-    if any(keyword in content for keyword in ['how to install pterodactyl', 'pterodactyl install', 'pterodactyl setup', 'install pterodactyl']):
-        embed = discord.Embed(title="🦕 Pterodactyl Panel Installation", color=discord.Color.blue())
-        embed.add_field(name="Official Documentation", value="https://pterodactyl.io/panel/1.0/getting_started.html", inline=False)
-        embed.add_field(name="Video Tutorial", value="Coming Soon! 🎥", inline=False)
-        embed.add_field(name="Quick Start", value="Use our VPS to host your Pterodactyl panel with our easy deployment system!", inline=False)
-        await message.channel.send(embed=embed)
+    bot.db.add_admin(user.id)
+    await ctx.send(f"✅ {user.mention} has been added as an admin!", ephemeral=True)
+
+@bot.hybrid_command(name='remove_admin', description='Remove an admin (Owner only)')
+@app_commands.describe(
+    user="User to remove from admin"
+)
+async def remove_admin(ctx, user: discord.User):
+    """Remove an admin user (Owner only)"""
+    if ctx.author.id != 1210291131301101618:  # Only the owner can remove admins
+        await ctx.send("❌ Only the owner can remove admins!", ephemeral=True)
+        return
     
-    await bot.process_commands(message)
+    bot.db.remove_admin(user.id)
+    await ctx.send(f"✅ {user.mention} has been removed from admins!", ephemeral=True)
 
-@bot.event
-async def on_member_join(member):
-    """Track REAL unique invites when members join"""
+@bot.hybrid_command(name='list_admins', description='List all admin users')
+async def list_admins(ctx):
+    """List all admin users"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+    
+    embed = discord.Embed(title="Admin Users", color=discord.Color.blue())
+    
+    # List user IDs in ADMIN_IDS
+    admin_list = []
+    for admin_id in ADMIN_IDS:
+        try:
+            user = await bot.fetch_user(admin_id)
+            admin_list.append(f"{user.name} ({user.id})")
+        except:
+            admin_list.append(f"Unknown User ({admin_id})")
+    
+    # List users with admin role
+    if ctx.guild:
+        admin_role = ctx.guild.get_role(ADMIN_ROLE_ID)
+        if admin_role:
+            role_admins = [f"{member.name} ({member.id})" for member in admin_role.members]
+            admin_list.extend(role_admins)
+    
+    if not admin_list:
+        embed.description = "No admins found"
+    else:
+        embed.description = "\n".join(sorted(set(admin_list)))  # Remove duplicates
+    
+    await ctx.send(embed=embed, ephemeral=True)
+
+@bot.hybrid_command(name='create_vps', description='Create a new VPS (Admin only)')
+@app_commands.describe(
+    memory="Memory in GB",
+    cpu="CPU cores",
+    disk="Disk space in GB",
+    owner="User who will own the VPS",
+    os_image="OS image to use",
+    use_custom_image="Use custom HostForge image (recommended)"
+)
+async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: discord.Member, 
+                           os_image: str = DEFAULT_OS_IMAGE, use_custom_image: bool = True):
+    """Create a new VPS with specified parameters (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    if bot.db.is_user_banned(owner.id):
+        await ctx.send("❌ This user is banned from creating VPS!", ephemeral=True)
+        return
+
+    if not ctx.guild:
+        await ctx.send("❌ This command can only be used in a server!", ephemeral=True)
+        return
+
+    if not bot.docker_client:
+        await ctx.send("❌ Docker is not available. Please contact the administrator.", ephemeral=True)
+        return
+
     try:
-        guild = member.guild
-        
-        # Get invites before and after join
-        invites_before = invite_snapshot.get(str(guild.id), {})
-        invites_after = await guild.invites()
-        
-        # Find which invite was used
-        used_invite = None
-        for invite in invites_after:
-            uses_before = invites_before.get(invite.code, {}).get('uses', 0)
-            if invite.uses > uses_before:
-                used_invite = invite
-                break
-        
-        if used_invite and used_invite.inviter:
-            inviter_id = used_invite.inviter.id
-            
-            # Check if this is a UNIQUE join (not rejoin)
-            if is_unique_join(member.id, inviter_id):
-                # Add as unique join
-                if add_unique_join(member.id, inviter_id):
-                    # Send success DM to inviter
-                    try:
-                        inviter_user = await bot.fetch_user(inviter_id)
-                        embed = discord.Embed(
-                            title="🎉 New Unique Invite!", 
-                            color=discord.Color.green(),
-                            description=f"**{member.name}** joined using your invite!"
-                        )
-                        embed.add_field(name="Total Unique Invites", value=f"`{users[str(inviter_id)]['inv_total']}`", inline=True)
-                        embed.add_field(name="Unclaimed", value=f"`{users[str(inviter_id)]['inv_unclaimed']}`", inline=True)
-                        embed.add_field(name="Use `/claimpoint`", value="Convert to points!", inline=True)
-                        embed.set_footer(text="This only counts unique joins (no rejoins)!")
-                        await inviter_user.send(embed=embed)
-                    except:
-                        pass  # User has DMs disabled
-                    
-                    logger.info(f"UNIQUE join: {member.name} invited by {used_invite.inviter.name}")
-                else:
-                    logger.info(f"REJOIN detected: {member.name} already invited by {used_invite.inviter.name}")
-            else:
-                logger.info(f"REJOIN ignored: {member.name} already counted for {used_invite.inviter.name}")
-        
-        # Update invite snapshot
-        invite_snapshot[str(guild.id)] = {
-            invite.code: {
-                'uses': invite.uses, 
-                'inviter': invite.inviter.id if invite.inviter else None
-            } for invite in invites_after
-        }
-        save_json(INV_CACHE_FILE, invite_snapshot)
-        
-    except Exception as e:
-        logger.error(f"Error tracking invite: {e}")
-
-# ---------------- Manage View ----------------
-class EnhancedManageView(discord.ui.View):
-    def __init__(self, container_id, message=None):
-        super().__init__(timeout=300)
-        self.container_id = container_id
-        self.vps = vps_db.get(container_id)
-        self.message = message
-        
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not can_manage_vps(interaction.user.id, self.container_id):
-            await interaction.response.send_message("❌ You don't have permission to manage this VPS.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🟢", row=0)
-    async def start_vps(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        
-        # Check if VPS is suspended/expired
-        if self.vps.get('suspended', False):
-            await interaction.followup.send("❌ VPS is suspended due to expiry. Please renew first.", ephemeral=True)
+        # Validate inputs
+        if memory < 1 or memory > 512:
+            await ctx.send("❌ Memory must be between 1GB and 512GB", ephemeral=True)
             return
-        
-        if not self.vps['active']:
-            success = await docker_start_container(self.container_id)
-            if success:
-                self.vps['active'] = True
-                persist_vps()
-                await send_log("VPS Started", interaction.user, self.container_id)
-                
-                embed = discord.Embed(
-                    title="✅ VPS Started Successfully",
-                    description=f"**Container ID:** `{self.container_id}`",
-                    color=discord.Color.green()
-                )
-                embed.add_field(name="Status", value="🟢 Running", inline=True)
-                embed.add_field(name="HTTP Access", value=f"http://{SERVER_IP}:{self.vps['http_port']}", inline=True)
-                await interaction.followup.send(embed=embed, ephemeral=True)
-            else:
-                await interaction.followup.send("❌ Failed to start VPS.", ephemeral=True)
-        else:
-            await interaction.followup.send("ℹ️ VPS is already running.", ephemeral=True)
-
-    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="🔴", row=0)
-    async def stop_vps(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        
-        if self.vps['active']:
-            success = await docker_stop_container(self.container_id)
-            if success:
-                self.vps['active'] = False
-                persist_vps()
-                await send_log("VPS Stopped", interaction.user, self.container_id)
-                
-                embed = discord.Embed(
-                    title="✅ VPS Stopped Successfully", 
-                    description=f"**Container ID:** `{self.container_id}`",
-                    color=discord.Color.orange()
-                )
-                embed.add_field(name="Status", value="🔴 Stopped", inline=True)
-                await interaction.followup.send(embed=embed, ephemeral=True)
-            else:
-                await interaction.followup.send("❌ Failed to stop VPS.", ephemeral=True)
-        else:
-            await interaction.followup.send("ℹ️ VPS is already stopped.", ephemeral=True)
-
-    @discord.ui.button(label="Restart", style=discord.ButtonStyle.primary, emoji="🔄", row=0)
-    async def restart_vps(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        
-        # Check if VPS is suspended/expired
-        if self.vps.get('suspended', False):
-            await interaction.followup.send("❌ VPS is suspended due to expiry. Please renew first.", ephemeral=True)
+        if cpu < 1 or cpu > 32:
+            await ctx.send("❌ CPU cores must be between 1 and 32", ephemeral=True)
             return
-        
-        success = await docker_restart_container(self.container_id)
-        if success:
-            self.vps['active'] = True
-            self.vps['suspended'] = False
-            persist_vps()
-            await send_log("VPS Restarted", interaction.user, self.container_id)
-            
-            embed = discord.Embed(
-                title="✅ VPS Restarted Successfully",
-                description=f"**Container ID:** `{self.container_id}`",
-                color=discord.Color.blue()
-            )
-            embed.add_field(name="Status", value="🟢 Running", inline=True)
-            embed.add_field(name="HTTP Access", value=f"http://{SERVER_IP}:{self.vps['http_port']}", inline=True)
-            await interaction.followup.send(embed=embed, ephemeral=True)
-        else:
-            await interaction.followup.send("❌ Failed to restart VPS.", ephemeral=True)
-
-    @discord.ui.button(label="Reinstall", style=discord.ButtonStyle.secondary, emoji="💾", row=1)
-    async def reinstall_vps(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        
-        # Check if VPS is suspended/expired
-        if self.vps.get('suspended', False):
-            await interaction.followup.send("❌ VPS is suspended due to expiry. Please renew first.", ephemeral=True)
+        if disk < 10 or disk > 1000:
+            await ctx.send("❌ Disk space must be between 10GB and 1000GB", ephemeral=True)
             return
-        
-        # Confirm reinstall
-        confirm_embed = discord.Embed(
-            title="⚠️ Confirm VPS Reinstall",
-            description="This will **DELETE ALL DATA** and reinstall your VPS with a fresh system.",
-            color=discord.Color.orange()
-        )
-        confirm_embed.add_field(name="Container ID", value=f"`{self.container_id}`", inline=False)
-        confirm_embed.add_field(name="⚠️ Warning", value="All your files, settings, and data will be permanently deleted!", inline=False)
-        confirm_embed.set_footer(text="This action cannot be undone!")
-        
-        confirm_view = discord.ui.View(timeout=60)
-        
-        @discord.ui.button(label="✅ Confirm Reinstall", style=discord.ButtonStyle.danger, emoji="💀")
-        async def confirm_reinstall(confirm_interaction: discord.Interaction, confirm_button: discord.ui.Button):
-            if confirm_interaction.user.id != interaction.user.id:
-                await confirm_interaction.response.send_message("❌ This is not your confirmation.", ephemeral=True)
-                return
-                
-            await confirm_interaction.response.defer(ephemeral=True)
-            
-            # Stop and remove current container
-            await docker_stop_container(self.container_id)
-            await docker_remove_container(self.container_id)
-            
-            # Create new VPS with same specs
-            rec = await create_vps(int(self.vps['owner']), ram=self.vps['ram'], cpu=self.vps['cpu'], disk=self.vps['disk'])
-            
-            if 'error' in rec:
-                await confirm_interaction.followup.send(f"❌ Error reinstalling VPS: {rec['error']}", ephemeral=True)
-                return
-            
-            # Update the VPS record with new container info but keep expiry
-            old_expiry = self.vps['expires_at']
-            vps_db.pop(self.container_id, None)  # Remove old record
-            rec['expires_at'] = old_expiry  # Keep original expiry
-            vps_db[rec['container_id']] = rec
-            persist_vps()
-            
-            await send_log("VPS Reinstalled", interaction.user, rec['container_id'], "Full system reset")
-            
-            success_embed = discord.Embed(
-                title="✅ VPS Reinstalled Successfully",
-                description="Your VPS has been completely reset with a fresh system.",
-                color=discord.Color.green()
-            )
-            success_embed.add_field(name="New Container ID", value=f"`{rec['container_id']}`", inline=False)
-            success_embed.add_field(name="Specs", value=f"{rec['ram']}GB RAM | {rec['cpu']} CPU | {rec['disk']}GB Disk", inline=True)
-            success_embed.add_field(name="HTTP Access", value=f"http://{SERVER_IP}:{rec['http_port']}", inline=True)
-            success_embed.add_field(name="SSH", value=f"```{rec['ssh']}```", inline=False)
-            
-            await confirm_interaction.followup.send(embed=success_embed, ephemeral=True)
-            
-            # Update the original message
+
+        # Check if we've reached container limit
+        containers = bot.docker_client.containers.list(all=True)
+        if len(containers) >= bot.db.get_setting('max_containers', MAX_CONTAINERS):
+            await ctx.send(f"❌ Maximum container limit reached ({bot.db.get_setting('max_containers')}). Please delete some VPS instances first.", ephemeral=True)
+            return
+
+        # Check if user already has maximum VPS instances
+        if bot.db.get_user_vps_count(owner.id) >= bot.db.get_setting('max_vps_per_user', MAX_VPS_PER_USER):
+            await ctx.send(f"❌ {owner.mention} already has the maximum number of VPS instances ({bot.db.get_setting('max_vps_per_user')})", ephemeral=True)
+            return
+
+        status_msg = await ctx.send("🚀 Creating HostForge VPS instance... This may take a few minutes.")
+
+        memory_bytes = memory * 1024 * 1024 * 1024
+        vps_id = generate_vps_id()
+        username = "root"
+        password = "root"
+        token = generate_token()
+        external_port = get_available_port(bot.db)
+
+        if use_custom_image:
+            await status_msg.edit(content="🔨 Building custom Docker image...")
             try:
-                await interaction.delete_original_response()
-            except:
-                pass
-        
-        @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
-        async def cancel_reinstall(confirm_interaction: discord.Interaction, cancel_button: discord.ui.Button):
-            if confirm_interaction.user.id != interaction.user.id:
-                await confirm_interaction.response.send_message("❌ This is not your confirmation.", ephemeral=True)
+                image_tag = await build_custom_image(vps_id, os_image)
+            except Exception as e:
+                await status_msg.edit(content=f"❌ Failed to build Docker image: {str(e)}")
                 return
-                
-            await confirm_interaction.response.send_message("✅ Reinstall cancelled.", ephemeral=True)
-        
-        confirm_view.add_item(confirm_reinstall)
-        confirm_view.add_item(cancel_reinstall)
-        
-        await interaction.followup.send(embed=confirm_embed, view=confirm_view, ephemeral=True)
 
-    @discord.ui.button(label="Time Left", style=discord.ButtonStyle.secondary, emoji="⏰", row=1)
-    async def time_left(self, interaction: discord.Interaction, button: discord.ui.Button):
-        expires = datetime.fromisoformat(self.vps['expires_at'])
-        now = datetime.utcnow()
+            await status_msg.edit(content="⚙️ Initializing container...")
+            try:
+                container = bot.docker_client.containers.run(
+                    image_tag,
+                    detach=True,
+                    privileged=True,
+                    hostname=f"hostforge-{vps_id}",
+                    mem_limit=memory_bytes,
+                    cpu_period=100000,
+                    cpu_quota=int(cpu * 100000),
+                    cap_add=["ALL"],
+                    network=DOCKER_NETWORK,
+                    ports={'22/tcp': str(external_port)},
+                    volumes={
+                        f'hostforge-{vps_id}': {'bind': '/data', 'mode': 'rw'}
+                    },
+                    restart_policy={"Name": "always"}
+                )
+            except Exception as e:
+                await status_msg.edit(content=f"❌ Failed to start container: {str(e)}")
+                return
+        else:
+            await status_msg.edit(content="⚙️ Initializing container...")
+            try:
+                container = bot.docker_client.containers.run(
+                    os_image,
+                    detach=True,
+                    privileged=True,
+                    hostname=f"hostforge-{vps_id}",
+                    mem_limit=memory_bytes,
+                    cpu_period=100000,
+                    cpu_quota=int(cpu * 100000),
+                    cap_add=["ALL"],
+                    command="tail -f /dev/null",
+                    tty=True,
+                    network=DOCKER_NETWORK,
+                    ports={'22/tcp': str(external_port)},
+                    volumes={
+                        f'hostforge-{vps_id}': {'bind': '/data', 'mode': 'rw'}
+                    },
+                    restart_policy={"Name": "always"}
+                )
+            except docker.errors.ImageNotFound:
+                await status_msg.edit(content=f"❌ OS image {os_image} not found. Using default {DEFAULT_OS_IMAGE}")
+                container = bot.docker_client.containers.run(
+                    DEFAULT_OS_IMAGE,
+                    detach=True,
+                    privileged=True,
+                    hostname=f"hostforge-{vps_id}",
+                    mem_limit=memory_bytes,
+                    cpu_period=100000,
+                    cpu_quota=int(cpu * 100000),
+                    cap_add=["ALL"],
+                    command="tail -f /dev/null",
+                    tty=True,
+                    network=DOCKER_NETWORK,
+                    ports={'22/tcp': str(external_port)},
+                    volumes={
+                        f'hostforge-{vps_id}': {'bind': '/data', 'mode': 'rw'}
+                    },
+                    restart_policy={"Name": "always"}
+                )
+                os_image = DEFAULT_OS_IMAGE
+
+        await status_msg.edit(content="🔧 Container created. Setting up HostForge environment...")
+        await asyncio.sleep(5)
+
+        setup_success, _ = await setup_container(
+            container.id, 
+            status_msg, 
+            memory, 
+            vps_id=vps_id,
+            use_custom_image=use_custom_image
+        )
+        if not setup_success:
+            raise Exception("Failed to setup container")
+
+        await status_msg.edit(content="🔐 Starting SSH session...")
+
+        exec_cmd = await asyncio.create_subprocess_exec(
+            "docker", "exec", container.id, "tmate", "-F",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        ssh_session_line = await capture_ssh_session_line(exec_cmd)
+        if not ssh_session_line:
+            raise Exception("Failed to get tmate session")
         
-        if expires > now:
-            time_left = expires - now
-            days = time_left.days
-            hours = time_left.seconds // 3600
-            minutes = (time_left.seconds % 3600) // 60
+        vps_data = {
+            "token": token,
+            "vps_id": vps_id,
+            "container_id": container.id,
+            "memory": memory,
+            "cpu": cpu,
+            "disk": disk,
+            "username": username,
+            "password": password,
+            "root_password": "root",
+            "created_by": str(owner.id),
+            "created_at": str(datetime.datetime.now()),
+            "tmate_session": ssh_session_line,
+            "watermark": WATERMARK,
+            "os_image": os_image,
+            "restart_count": 0,
+            "last_restart": None,
+            "status": "running",
+            "use_custom_image": use_custom_image,
+            "external_ssh_port": external_port
+        }
+        
+        bot.db.add_vps(vps_data)
+        
+        try:
+            embed = discord.Embed(title="🎉 VPS Created Successfully!", color=discord.Color.green())
+            embed.add_field(name="🆔 VPS ID", value=vps_id, inline=True)
+            embed.add_field(name="💾 Memory", value=f"{memory}GB", inline=True)
+            embed.add_field(name="⚡ CPU", value=f"{cpu} cores", inline=True)
+            embed.add_field(name="💿 Disk", value=f"{disk}GB", inline=True)
+            embed.add_field(name="👤 Username", value=username, inline=True)
+            embed.add_field(name="🔑 Password", value=f"||{password}||", inline=False)
+            embed.add_field(name="🔒 Tmate Session", value=f"||```{ssh_session_line}```||", inline=False)
+            embed.add_field(name="🔌 Direct SSH", value=f"||```ssh root@{bot.public_ip} -p {external_port}```||", inline=False)
+            embed.add_field(name="ℹ️ Note", value="This is a HostForge VPS instance. You can install and configure additional packages as needed. Connect using Tmate Session only.", inline=False)
             
-            embed = discord.Embed(
-                title="⏰ VPS Time Remaining",
-                description=f"**Container ID:** `{self.container_id}`",
-                color=discord.Color.blue()
-            )
+            await owner.send(embed=embed)
+            await status_msg.edit(content=f"✅ HostForge VPS creation successful! VPS has been created for {owner.mention}. Check your DMs for connection details.")
+        except discord.Forbidden:
+            await status_msg.edit(content=f"❌ I couldn't send a DM to {owner.mention}. Please ask them to enable DMs from server members.")
             
-            # Progress bar visualization
-            total_days = 15  # Assuming 15-day VPS lifetime
-            progress_percent = min((days / total_days) * 100, 100)
-            progress_bar = "🟢" * int(progress_percent / 20) + "⚫" * (5 - int(progress_percent / 20))
-            
+    except Exception as e:
+        error_msg = f"❌ An error occurred while creating the VPS: {str(e)}"
+        logger.error(error_msg)
+        await ctx.send(error_msg)
+        if 'container' in locals():
+            try:
+                container.stop()
+                container.remove()
+            except Exception as e:
+                logger.error(f"Error cleaning up container: {e}")
+
+@bot.hybrid_command(name='list', description='List all your VPS instances')
+async def list_vps(ctx):
+    """List all VPS instances owned by the user"""
+    try:
+        user_vps = bot.db.get_user_vps(ctx.author.id)
+        
+        if not user_vps:
+            await ctx.send("You don't have any VPS instances.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title="Your HostForge VPS Instances", color=discord.Color.blue())
+        
+        for vps in user_vps:
+            try:
+                # Handle missing container ID gracefully
+                container = bot.docker_client.containers.get(vps["container_id"]) if vps["container_id"] else None
+                status = vps['status'].capitalize() if vps.get('status') else "Unknown"
+            except Exception as e:
+                status = "Not Found"
+                logger.error(f"Error fetching container {vps['container_id']}: {e}")
+
+            # Adding fields safely to prevent missing keys causing errors
             embed.add_field(
-                name="📅 Time Remaining",
-                value=f"```\n{progress_bar} {progress_percent:.1f}%\n{days} days, {hours} hours, {minutes} minutes\n```",
+                name=f"VPS {vps['vps_id']}",
+                value=f"""
+Status: {status}
+Memory: {vps.get('memory', 'Unknown')}GB
+CPU: {vps.get('cpu', 'Unknown')} cores
+Disk Allocated: {vps.get('disk', 'Unknown')}GB
+Username: {vps.get('username', 'Unknown')}
+OS: {vps.get('os_image', DEFAULT_OS_IMAGE)}
+Created: {vps.get('created_at', 'Unknown')}
+Restarts: {vps.get('restart_count', 0)}
+SSH Port: {vps.get('external_ssh_port', 'Not set')}
+""",
                 inline=False
             )
-            
-            embed.add_field(name="Expiry Date", value=f"`{expires.strftime('%Y-%m-%d %H:%M UTC')}`", inline=True)
-            
-            if days <= 3:
-                embed.add_field(
-                    name="⚠️ Warning", 
-                    value="Your VPS will expire soon! Renew to avoid suspension.", 
-                    inline=False
-                )
-            
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        else:
-            embed = discord.Embed(
-                title="❌ VPS Expired",
-                description="Your VPS has been suspended due to expiry.",
-                color=discord.Color.red()
-            )
-            embed.add_field(name="Container ID", value=f"`{self.container_id}`", inline=False)
-            embed.add_field(name="Status", value="⏸️ Suspended", inline=True)
-            embed.add_field(name="Action Required", value="Use the **⏳ Renew** button to reactivate", inline=True)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @discord.ui.button(label="Renew", style=discord.ButtonStyle.success, emoji="⏳", row=1)
-    async def renew_vps(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.vps.get('giveaway_vps', False):
-            embed = discord.Embed(
-                title="❌ Giveaway VPS",
-                description="This is a giveaway VPS and cannot be renewed.",
-                color=discord.Color.orange()
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-            
-        uid = str(interaction.user.id)
-        if uid not in users:
-            users[uid] = {"points": 0, "inv_unclaimed": 0, "inv_total": 0}
-            persist_users()
         
-        # Get current renew mode (default to 15 days)
-        current_mode = renew_mode.get("mode", "15")
-        cost = POINTS_RENEW_15 if current_mode == "15" else POINTS_RENEW_30
-        days = 15 if current_mode == "15" else 15
-        
-        if users[uid]['points'] < cost:
-            embed = discord.Embed(
-                title="❌ Insufficient Points",
-                description=f"You need **{cost} points** to renew for **{days} days**.",
-                color=discord.Color.red()
-            )
-            embed.add_field(name="Your Points", value=f"`{users[uid]['points']}`", inline=True)
-            embed.add_field(name="Required", value=f"`{cost}`", inline=True)
-            embed.add_field(name="Missing", value=f"`{cost - users[uid]['points']}`", inline=True)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-        
-        # Confirm renewal
-        current_expiry = datetime.fromisoformat(self.vps['expires_at'])
-        new_expiry = max(datetime.utcnow(), current_expiry) + timedelta(days=days)
-        
-        confirm_embed = discord.Embed(
-            title="🔄 Confirm VPS Renewal",
-            description=f"Renew **{self.container_id}** for **{days} days**?",
-            color=discord.Color.gold()
-        )
-        confirm_embed.add_field(name="Cost", value=f"`{cost} points`", inline=True)
-        confirm_embed.add_field(name="Duration", value=f"`{days} days`", inline=True)
-        confirm_embed.add_field(name="New Expiry", value=f"`{new_expiry.strftime('%Y-%m-%d %H:%M')}`", inline=False)
-        confirm_embed.add_field(name="Your Points", value=f"`{users[uid]['points']} → {users[uid]['points'] - cost}`", inline=True)
-        
-        confirm_view = discord.ui.View(timeout=60)
-        
-        @discord.ui.button(label="✅ Confirm Renew", style=discord.ButtonStyle.success)
-        async def confirm_renew(confirm_interaction: discord.Interaction, confirm_button: discord.ui.Button):
-            if confirm_interaction.user.id != interaction.user.id:
-                await confirm_interaction.response.send_message("❌ This is not your confirmation.", ephemeral=True)
-                return
-                
-            await confirm_interaction.response.defer(ephemeral=True)
-            
-            # Deduct points and extend expiry
-            users[uid]['points'] -= cost
-            persist_users()
-            
-            self.vps['expires_at'] = new_expiry.isoformat()
-            self.vps['active'] = True
-            self.vps['suspended'] = False
-            persist_vps()
-            
-            await send_log("VPS Renewed", interaction.user, self.container_id, f"Extended by {days} days")
-            
-            # Auto-start the VPS if it was suspended
-            if not self.vps['active']:
-                await docker_start_container(self.container_id)
-                self.vps['active'] = True
-                persist_vps()
-            
-            success_embed = discord.Embed(
-                title="✅ VPS Renewed Successfully",
-                description=f"**{self.container_id}** has been renewed for **{days} days**",
-                color=discord.Color.green()
-            )
-            success_embed.add_field(name="Cost", value=f"`{cost} points`", inline=True)
-            success_embed.add_field(name="New Expiry", value=f"`{new_expiry.strftime('%Y-%m-%d %H:%M')}`", inline=True)
-            success_embed.add_field(name="Remaining Points", value=f"`{users[uid]['points']}`", inline=True)
-            success_embed.add_field(name="Status", value="🟢 Active & Running", inline=False)
-            
-            await confirm_interaction.followup.send(embed=success_embed, ephemeral=True)
-        
-        @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
-        async def cancel_renew(confirm_interaction: discord.Interaction, cancel_button: discord.ui.Button):
-            if confirm_interaction.user.id != interaction.user.id:
-                await confirm_interaction.response.send_message("❌ This is not your confirmation.", ephemeral=True)
-                return
-                
-            await confirm_interaction.response.send_message("✅ Renewal cancelled.", ephemeral=True)
-        
-        confirm_view.add_item(confirm_renew)
-        confirm_view.add_item(cancel_renew)
-        
-        await interaction.response.send_message(embed=confirm_embed, view=confirm_view, ephemeral=True)
-
-    @discord.ui.button(label="Reset SSH", style=discord.ButtonStyle.secondary, emoji="🔑", row=2)
-    async def reset_ssh(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        
-        # Check if VPS is suspended/expired
-        if self.vps.get('suspended', False):
-            await interaction.followup.send("❌ VPS is suspended due to expiry. Please renew first.", ephemeral=True)
-            return
-        
-        ssh, err = await docker_exec_capture_ssh(self.container_id)
-        if err:
-            await interaction.followup.send(f"⚠️ SSH reset with warning: {err}", ephemeral=True)
-        
-        self.vps['ssh'] = ssh
-        persist_vps()
-        await send_log("SSH Reset", interaction.user, self.container_id)
-        
-        embed = discord.Embed(
-            title="🔑 New SSH Connection Details",
-            description=f"**Container ID:** `{self.container_id}`",
-            color=discord.Color.green()
-        )
-        embed.add_field(name="SSH Command", value=f"```{ssh}```", inline=False)
-        embed.add_field(name="Note", value="Save this SSH connection string securely!", inline=False)
-        
-        await interaction.followup.send(embed=embed, ephemeral=True)
-# ---------------- Giveaway View ----------------
-class GiveawayView(discord.ui.View):
-    def __init__(self, giveaway_id):
-        super().__init__(timeout=None)
-        self.giveaway_id = giveaway_id
-        
-    @discord.ui.button(label="🎉 Join Giveaway", style=discord.ButtonStyle.primary, custom_id="join_giveaway")
-    async def join_giveaway(self, interaction: discord.Interaction, button: discord.ui.Button):
-        giveaway = giveaways.get(self.giveaway_id)
-        if not giveaway or giveaway['status'] != 'active':
-            await interaction.response.send_message("❌ This giveaway has ended.", ephemeral=True)
-            return
-        
-        participant_id = str(interaction.user.id)
-        participants = giveaway.get('participants', [])
-        
-        if participant_id in participants:
-            await interaction.response.send_message("❌ You have already joined this giveaway.", ephemeral=True)
-            return
-        
-        participants.append(participant_id)
-        giveaway['participants'] = participants
-        persist_giveaways()
-        
-        await interaction.response.send_message("✅ You have successfully joined the giveaway!", ephemeral=True)
-
-# ---------------- COMMANDS REGISTRATION ----------------
-# All commands are now properly registered as app_commands
-
-@bot.tree.command(name="deploy", description="Deploy a VPS (cost 4 points)")
-async def deploy(interaction: discord.Interaction):
-    """Deploy a new VPS - Points required before deployment"""
-    uid = str(interaction.user.id)
-    if uid not in users: 
-        users[uid] = {"points": 0, "inv_unclaimed": 0, "inv_total": 0}
-        persist_users()
-    
-    # Check points and BLOCK deployment if not enough
-    has_enough_points = users[uid]['points'] >= POINTS_PER_DEPLOY
-    is_admin = interaction.user.id in ADMIN_IDS
-    
-    # If user doesn't have enough points and is not admin, BLOCK deployment
-    if not has_enough_points and not is_admin:
-        await interaction.response.send_message(
-            f"❌ You need {POINTS_PER_DEPLOY} points to deploy a VPS. You only have {users[uid]['points']} points.\n\n"
-            f"**Ways to earn points:**\n"
-            f"• Use `/invite` to get invite links\n"
-            f"• Ask friends to join using your invite code\n"
-            f"• Wait for daily point resets\n"
-            f"• Participate in giveaways",
-            ephemeral=True
-        )
-        return
-    
-    original_points = users[uid]['points']
-    
-    # Send initial response based on points status
-    if not is_admin:
-        await interaction.response.send_message(
-            f"✅ You have enough points! Deploying VPS... (Cost: {POINTS_PER_DEPLOY} points)", 
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            "🛠️ Admin deployment in progress...", 
-            ephemeral=True
-        )
-    
-    # Defer if not already done
-    if not interaction.response.is_done():
-        await interaction.response.defer(ephemeral=True)
-    
-    # Create VPS first
-    rec = await create_vps(interaction.user.id)
-    
-    if 'error' in rec:
-        await interaction.followup.send(f"❌ Error creating VPS: {rec['error']}", ephemeral=True)
-        return
-    
-    # Deduct points after successful VPS creation (only if not admin)
-    points_deducted = 0
-    if not is_admin:
-        users[uid]['points'] -= POINTS_PER_DEPLOY
-        points_deducted = POINTS_PER_DEPLOY
-        persist_users()
-    
-    systemctl_status = "✅ Working" if rec.get('systemctl_working') else "⚠️ Limited"
-    
-    embed = discord.Embed(title="🎉 Your VPS is Ready!", color=discord.Color.green())
-    embed.add_field(name="Container ID", value=f"`{rec['container_id']}`", inline=False)
-    embed.add_field(name="Specs", value=f"**{rec['ram']}GB RAM** | **{rec['cpu']} CPU** | **{rec['disk']}GB Disk**", inline=False)
-    embed.add_field(name="Expires", value=rec['expires_at'][:10], inline=True)
-    embed.add_field(name="Status", value="🟢 Active", inline=True)
-    embed.add_field(name="Systemctl", value=systemctl_status, inline=True)
-    embed.add_field(name="HTTP Access", value=f"http://{SERVER_IP}:{rec['http_port']}", inline=False)
-    embed.add_field(name="SSH Connection", value=f"```{rec['ssh']}```", inline=False)
-    
-    if not is_admin:
-        embed.add_field(name="Points Deducted", value=f"{-POINTS_PER_DEPLOY} points", inline=True)
-        embed.add_field(name="Remaining Points", value=f"{users[uid]['points']} points", inline=True)
-    
-    try: 
-        await interaction.user.send(embed=embed)
-        followup_msg = "✅ VPS created successfully! Check your DMs for details."
-        if not is_admin:
-            followup_msg += f"\n📊 Points: {original_points} → {users[uid]['points']} (-{POINTS_PER_DEPLOY})"
-        await interaction.followup.send(followup_msg, ephemeral=True)
-    except: 
-        followup_msg = "✅ VPS created! Could not DM you. Enable DMs from server members."
-        if not is_admin:
-            followup_msg += f"\n📊 Points: {original_points} → {users[uid]['points']} (-{POINTS_PER_DEPLOY})"
-        await interaction.followup.send(followup_msg, embed=embed, ephemeral=True)
-    
-    # Send log
-    await send_log(
-        "VPS Deployed", 
-        interaction.user, 
-        details=f"New VPS created with {rec['ram']}GB RAM, {rec['cpu']} CPU, {rec['disk']}GB Disk",
-        vps_id=rec['container_id']
-    )
-
-@bot.tree.command(name="list", description="List your VPS")
-async def list_vps(interaction: discord.Interaction):
-    """List all your VPS"""
-    uid = str(interaction.user.id)
-    user_vps = get_user_vps(interaction.user.id)
-    
-    if not user_vps:
-        await interaction.response.send_message("❌ No VPS found.", ephemeral=True)
-        return
-    
-    embed = discord.Embed(title="Your VPS List", color=discord.Color.blue())
-    for vps in user_vps:
-        status = "🟢 Running" if vps['active'] and not vps.get('suspended', False) else "🔴 Stopped"
-        if vps.get('suspended', False):
-            status = "⏸️ Suspended"
-        
-        expires = datetime.fromisoformat(vps['expires_at']).strftime('%Y-%m-%d')
-        systemctl_status = "✅" if vps.get('systemctl_working') else "❌"
-        
-        value = f"**Specs:** {vps['ram']}GB RAM | {vps['cpu']} CPU | {vps['disk']}GB Disk\n"
-        value += f"**Status:** {status} | **Expires:** {expires}\n"
-        value += f"**Systemctl:** {systemctl_status} | **HTTP:** http://{SERVER_IP}:{vps['http_port']}\n"
-        value += f"**Container ID:** `{vps['container_id']}`"
-        
-        if vps.get('additional_ports'):
-            value += f"\n**Extra Ports:** {', '.join(map(str, vps['additional_ports']))}"
-        
-        if vps.get('giveaway_vps'):
-            value += f"\n**Type:** 🎁 Giveaway VPS"
-        
-        embed.add_field(
-            name=f"VPS - {vps['container_id'][:8]}...", 
-            value=value, 
-            inline=False
-        )
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="remove", description="Remove your VPS and get half points refund")
-@app_commands.describe(container_id="Container ID to remove")
-async def remove_vps(interaction: discord.Interaction, container_id: str):
-    """Remove a VPS and get half points refunded"""
-    cid = container_id.strip()
-    rec = vps_db.get(cid)
-    if not rec:
-        await interaction.response.send_message("❌ No VPS found with that ID.", ephemeral=True)
-        return
-    
-    uid = str(interaction.user.id)
-    if rec['owner'] != uid and interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ You don't have permission to remove this VPS.", ephemeral=True)
-        return
-    
-    # Send warning message first
-    refund_amount = POINTS_PER_DEPLOY // 2  # Half points refund
-    warning_msg = (
-        f"⚠️ **Warning: You are about to remove VPS `{cid}`**\n\n"
-        f"• Only **{refund_amount} points** will be refunded (half of deployment cost)\n"
-        f"• Your current balance: **{users.get(uid, {}).get('points', 0)} points**\n"
-        f"• After refund: **{users.get(uid, {}).get('points', 0) + refund_amount} points**\n\n"
-        f"**Are you sure you want to proceed?**"
-    )
-    
-    # Create a confirmation view
-    class ConfirmView(discord.ui.View):
-        def __init__(self):
-            super().__init__(timeout=30.0)
-            self.value = None
-        
-        @discord.ui.button(label='Confirm Remove', style=discord.ButtonStyle.danger)
-        async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-            self.value = True
-            self.stop()
-            await interaction.response.defer()
-        
-        @discord.ui.button(label='Cancel', style=discord.ButtonStyle.secondary)
-        async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-            self.value = False
-            self.stop()
-            await interaction.response.send_message("✅ Removal cancelled.", ephemeral=True)
-    
-    view = ConfirmView()
-    await interaction.response.send_message(warning_msg, view=view, ephemeral=True)
-    
-    # Wait for user response
-    await view.wait()
-    
-    if view.value is None:
-        await interaction.followup.send("⏰ Removal timed out. Please try again.", ephemeral=True)
-        return
-    elif not view.value:
-        return  # User cancelled
-    
-    # Proceed with removal
-    await interaction.followup.send("🔄 Removing VPS...", ephemeral=True)
-    
-    success = await docker_remove_container(cid)
-    if not success:
-        await interaction.followup.send("⚠️ Failed to remove container. It might already be removed.", ephemeral=True)
-        return
-    
-    # Refund half points only if user owns it and is not admin
-    refund_given = False
-    if rec['owner'] == uid and interaction.user.id not in ADMIN_IDS and not rec.get('giveaway_vps', False):
-        users[uid]['points'] += refund_amount
-        persist_users()
-        refund_given = True
-    
-    vps_db.pop(cid, None)
-    persist_vps()
-    await send_log("VPS Removed", interaction.user, cid)
-    
-    result_msg = f"✅ VPS `{cid}` removed successfully."
-    if refund_given:
-        result_msg += f" Refunded {refund_amount} points (half of deployment cost)."
-    
-    await interaction.followup.send(result_msg, ephemeral=True)
-
-@bot.tree.command(name="manage", description="Interactive panel for VPS management")
-@app_commands.describe(container_id="Container ID to manage")
-async def manage(interaction: discord.Interaction, container_id: str):
-    """Manage your VPS with interactive buttons"""
-    cid = container_id.strip()
-    if not can_manage_vps(interaction.user.id, cid):
-        await interaction.response.send_message("❌ You don't have permission to manage this VPS or VPS not found.", ephemeral=True)
-        return
-    
-    vps = vps_db[cid]
-    
-    # Calculate time left
-    expires = datetime.fromisoformat(vps['expires_at'])
-    now = datetime.utcnow()
-    time_left = expires - now if expires > now else timedelta(0)
-    days_left = time_left.days
-    hours_left = time_left.seconds // 3600
-    minutes_left = (time_left.seconds % 3600) // 60
-    
-    # Status with emojis
-    if vps.get('suspended', False):
-        status = "⏸️ Suspended (Expired)"
-        status_color = 0xff9900  # Orange
-    elif not vps['active']:
-        status = "🔴 Stopped"
-        status_color = 0xff0000  # Red
-    else:
-        status = "🟢 Running"
-        status_color = 0x00ff00  # Green
-    
-    # VPS Type
-    vps_type = "🎁 Giveaway VPS" if vps.get('giveaway_vps') else "💎 Premium VPS"
-    
-    # Create beautiful embed
-    embed = discord.Embed(
-        title=f"🚀 VPS Management Panel", 
-        description=f"**Container ID:** `{cid}`",
-        color=status_color,
-        timestamp=datetime.utcnow()
-    )
-    
-    # Header Section
-    embed.add_field(
-        name="📊 **VPS Overview**",
-        value=f"```\n⚡ Status: {status}\n🎯 Type: {vps_type}\n🛡️ Systemctl: {'✅ Working' if vps.get('systemctl_working') else '❌ Not Working'}\n```",
-        inline=False
-    )
-    
-    # Specifications Section
-    embed.add_field(
-        name="💻 **Specifications**",
-        value=f"```\n🧠 RAM: {vps['ram']}GB\n⚡ CPU: {vps['cpu']} Cores\n💾 Disk: {vps['disk']}GB\n🌐 HTTP Port: {vps['http_port']}\n```",
-        inline=True
-    )
-    
-    # Time & Expiry Section
-    time_display = f"{days_left}d {hours_left}h {minutes_left}m" if days_left > 0 else "EXPIRED"
-    time_emoji = "🟢" if days_left > 7 else "🟡" if days_left > 3 else "🔴"
-    
-    embed.add_field(
-        name="⏰ **Time & Expiry**",
-        value=f"```\n{time_emoji} Time Left: {time_display}\n📅 Created: {vps['created_at'][:10]}\n⏳ Expires: {vps['expires_at'][:10]}\n```",
-        inline=True
-    )
-    
-    # Additional Ports
-    if vps.get('additional_ports'):
-        embed.add_field(
-            name="🔌 **Additional Ports**",
-            value=f"`{', '.join(map(str, vps['additional_ports']))}`",
-            inline=False
-        )
-    
-    # Renewal Information (if not giveaway)
-    if not vps.get('giveaway_vps', False):
-        current_mode = renew_mode.get("mode", "15")  # Default to 15 days
-        cost = POINTS_RENEW_15 if current_mode == "15" else POINTS_RENEW_30
-        days = 15 if current_mode == "15" else 15
-        
-        renew_info = f"```\n💰 Cost: {cost} points\n⏳ Duration: {days} days\n🔄 Auto-suspend: After expiry\n✅ Auto-resume: After renew\n```"
-        
-        embed.add_field(
-            name="🔄 **Renewal Options**",
-            value=renew_info,
-            inline=False
-        )
-    
-    # Quick Stats
-    embed.add_field(
-        name="📈 **Quick Stats**",
-        value=f"```\n🎯 Uptime: {'Active' if vps['active'] else 'Inactive'}\n🛡️ Protected: {'Yes' if not vps.get('giveaway_vps') else 'No'}\n🔧 Managed: Yes\n```",
-        inline=True
-    )
-    
-    # Footer with instructions
-    if vps.get('suspended', False):
-        embed.add_field(
-            name="⚠️ **VPS Suspended**",
-            value="Your VPS has been suspended due to expiry. Use the **⏳ Renew** button to reactivate it!",
-            inline=False
-        )
-    
-    embed.set_footer(
-        text="💡 Tip: Use the buttons below to manage your VPS", 
-        icon_url=interaction.user.display_avatar.url
-    )
-    
-    # Create enhanced view
-    view = EnhancedManageView(cid)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-@bot.tree.command(name="status", description="Check VPS status and system information")
-async def status(interaction: discord.Interaction):
-    """Check VPS status and system information"""
-    embed = discord.Embed(title="📊 VPS System Status", color=discord.Color.blue())
-    
-    # Count VPS
-    total_vps = len(vps_db)
-    active_vps = len([v for v in vps_db.values() if v['active']])
-    suspended_vps = len([v for v in vps_db.values() if v.get('suspended', False)])
-    systemctl_working = len([v for v in vps_db.values() if v.get('systemctl_working', False)])
-    
-    embed.add_field(name="Total VPS", value=str(total_vps), inline=True)
-    embed.add_field(name="Active VPS", value=str(active_vps), inline=True)
-    embed.add_field(name="Suspended VPS", value=str(suspended_vps), inline=True)
-    embed.add_field(name="Systemctl Working", value=f"{systemctl_working}/{total_vps}", inline=True)
-    
-    # Resource usage for admin
-    if interaction.user.id in ADMIN_IDS:
-        usage = get_resource_usage()
-        embed.add_field(name="📈 Resource Usage", value=f"**RAM:** {usage['ram']:.1f}% ({usage['total_ram']}GB)\n**CPU:** {usage['cpu']:.1f}% ({usage['total_cpu']} cores)\n**Disk:** {usage['disk']:.1f}% ({usage['total_disk']}GB)", inline=False)
-    
-    # System info
-    try:
-        # Get Docker info
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "info", "--format", "{{.ServerVersion}}",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        docker_version = stdout.decode().strip() if stdout else "Unknown"
-        
-        embed.add_field(name="Docker Version", value=docker_version, inline=True)
-    except:
-        embed.add_field(name="Docker Version", value="Unknown", inline=True)
-    
-    embed.add_field(name="Server IP", value=SERVER_IP, inline=True)
-    embed.add_field(name="Default Specs", value=f"{DEFAULT_RAM_GB}GB RAM, {DEFAULT_CPU} CPU, {DEFAULT_DISK_GB}GB Disk", inline=False)
-    
-    # Recent activity
-    recent_vps = list(vps_db.values())[-3:] if vps_db else []
-    if recent_vps:
-        recent_info = ""
-        for vps in recent_vps:
-            status = "🟢" if vps['active'] else "🔴"
-            systemctl = "✅" if vps.get('systemctl_working') else "❌"
-            recent_info += f"{status} `{vps['container_id'][:8]}` {systemctl}\n"
-        embed.add_field(name="Recent VPS", value=recent_info, inline=True)
-    
-    await interaction.response.send_message(embed=embed, ephemeral=False)
-
-@bot.tree.command(name="port", description="Add additional port to your VPS")
-@app_commands.describe(container_id="Your VPS container ID", port="Port number to add")
-async def port_add(interaction: discord.Interaction, container_id: str, port: int):
-    """Add additional port to VPS"""
-    cid = container_id.strip()
-    if not can_manage_vps(interaction.user.id, cid):
-        await interaction.response.send_message("❌ You don't have permission to manage this VPS or VPS not found.", ephemeral=True)
-        return
-    
-    if port < 1 or port > 65535:
-        await interaction.response.send_message("❌ Port must be between 1 and 65535.", ephemeral=True)
-        return
-    
-    vps = vps_db.get(cid)
-    if not vps:
-        await interaction.response.send_message("❌ VPS not found.", ephemeral=True)
-        return
-    
-    if port in vps.get('additional_ports', []):
-        await interaction.response.send_message("❌ Port already added to this VPS.", ephemeral=True)
-        return
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    success, message = await add_port_to_container(cid, port)
-    if success:
-        if 'additional_ports' not in vps:
-            vps['additional_ports'] = []
-        vps['additional_ports'].append(port)
-        persist_vps()
-        await send_log("Port Added", interaction.user, cid, f"Port: {port}")
-        await interaction.followup.send(f"✅ Port {port} added successfully to VPS `{cid}`", ephemeral=True)
-    else:
-        await interaction.followup.send(f"❌ Failed to add port: {message}", ephemeral=True)
-
-@bot.tree.command(name="mass_port", description="[ADMIN] Add port to multiple VPS")
-@app_commands.describe(port="Port number to add", container_ids="Comma-separated container IDs")
-async def mass_port(interaction: discord.Interaction, port: int, container_ids: str):
-    """[ADMIN] Add port to multiple VPS"""
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-        return
-    
-    if port < 1 or port > 65535:
-        await interaction.response.send_message("❌ Port must be between 1 and 65535.", ephemeral=True)
-        return
-    
-    container_list = [cid.strip() for cid in container_ids.split(',')]
-    valid_containers = []
-    invalid_containers = []
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    for cid in container_list:
-        if cid in vps_db:
-            vps = vps_db[cid]
-            if port not in vps.get('additional_ports', []):
-                success, _ = await add_port_to_container(cid, port)
-                if success:
-                    if 'additional_ports' not in vps:
-                        vps['additional_ports'] = []
-                    vps['additional_ports'].append(port)
-                    valid_containers.append(cid)
-                else:
-                    invalid_containers.append(cid)
-            else:
-                invalid_containers.append(cid)
-        else:
-            invalid_containers.append(cid)
-    
-    persist_vps()
-    await send_log("Mass Port Add", interaction.user, None, f"Port: {port}, Success: {len(valid_containers)}, Failed: {len(invalid_containers)}")
-    
-    result_msg = f"**Port {port} added to {len(valid_containers)} VPS**\n"
-    if valid_containers:
-        result_msg += f"✅ Success: {', '.join(valid_containers[:5])}{'...' if len(valid_containers) > 5 else ''}\n"
-    if invalid_containers:
-        result_msg += f"❌ Failed: {', '.join(invalid_containers[:5])}{'...' if len(invalid_containers) > 5 else ''}"
-    
-    await interaction.followup.send(result_msg, ephemeral=True)
-
-@bot.tree.command(name="share_vps", description="Share VPS access with another user")
-@app_commands.describe(container_id="Your VPS container ID", user="User to share with")
-async def share_vps(interaction: discord.Interaction, container_id: str, user: discord.Member):
-    """Share VPS access with another user"""
-    cid = container_id.strip()
-    vps = vps_db.get(cid)
-    
-    if not vps:
-        await interaction.response.send_message("❌ VPS not found.", ephemeral=True)
-        return
-    
-    if vps['owner'] != str(interaction.user.id):
-        await interaction.response.send_message("❌ You can only share VPS that you own.", ephemeral=True)
-        return
-    
-    if str(user.id) in vps.get('shared_with', []):
-        await interaction.response.send_message("❌ VPS is already shared with this user.", ephemeral=True)
-        return
-    
-    if 'shared_with' not in vps:
-        vps['shared_with'] = []
-    
-    vps['shared_with'].append(str(user.id))
-    persist_vps()
-    await send_log("VPS Shared", interaction.user, cid, f"Shared with: {user.name}")
-    
-    await interaction.response.send_message(f"✅ VPS `{cid}` shared with {user.mention}", ephemeral=True)
-
-@bot.tree.command(name="share_remove", description="Remove shared access from user")
-@app_commands.describe(container_id="Your VPS container ID", user="User to remove access from")
-async def share_remove(interaction: discord.Interaction, container_id: str, user: discord.Member):
-    """Remove shared VPS access from user"""
-    cid = container_id.strip()
-    vps = vps_db.get(cid)
-    
-    if not vps:
-        await interaction.response.send_message("❌ VPS not found.", ephemeral=True)
-        return
-    
-    if vps['owner'] != str(interaction.user.id) and interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ You can only manage sharing for VPS that you own.", ephemeral=True)
-        return
-    
-    if str(user.id) not in vps.get('shared_with', []):
-        await interaction.response.send_message("❌ VPS is not shared with this user.", ephemeral=True)
-        return
-    
-    vps['shared_with'].remove(str(user.id))
-    persist_vps()
-    await send_log("Share Removed", interaction.user, cid, f"Removed from: {user.name}")
-    
-    await interaction.response.send_message(f"✅ Removed VPS access from {user.mention}", ephemeral=True)
-
-@bot.tree.command(name="admin_add", description="[MAIN ADMIN] Add admin user")
-@app_commands.describe(user="User to make admin")
-async def admin_add(interaction: discord.Interaction, user: discord.Member):
-    """[MAIN ADMIN] Add admin user"""
-    # Check if user has permission to add admins
-    if interaction.user.id not in MAIN_ADMIN_IDS and interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("❌ Only main admin or owner can add admins.", ephemeral=True)
-        return
-    
-    # Load additional admins list from file
-    admin_file = os.path.join(DATA_DIR, "admins.json")
-    additional_admins = load_json(admin_file, [])
-    
-    # Check if user is already admin (in main or additional)
-    if user.id in ADMIN_IDS:
-        embed = discord.Embed(
-            title="❌ Already Admin",
-            description=f"**{user.name}** is already an admin.",
-            color=discord.Color.orange()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    # Add user to additional admins
-    additional_admins.append(user.id)
-    save_json(admin_file, additional_admins)
-    
-    # Update global ADMIN_IDS (for runtime)
-    ADMIN_IDS.add(user.id)
-    
-    await send_log("Admin Added", interaction.user, None, f"Added admin: {user.name}")
-    
-    # Create embed for response
-    embed = discord.Embed(
-        title="✅ Admin Added",
-        description=f"**{user.name}** has been granted admin privileges.",
-        color=discord.Color.green(),
-        timestamp=datetime.utcnow()
-    )
-    embed.add_field(name="Added By", value=interaction.user.mention, inline=True)
-    embed.add_field(name="User", value=user.mention, inline=True)
-    embed.add_field(name="Admin Type", value="🛡️ Additional Admin", inline=True)
-    embed.set_footer(text="This admin can be removed using /admin_remove")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="admin_remove", description="[MAIN ADMIN] Remove admin user")
-@app_commands.describe(user="User to remove from admin")
-async def admin_remove(interaction: discord.Interaction, user: discord.Member):
-    """[MAIN ADMIN] Remove admin user"""
-    # Check if user has permission to remove admins
-    if interaction.user.id not in MAIN_ADMIN_IDS and interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("❌ Only main admin or owner can remove admins.", ephemeral=True)
-        return
-    
-    # Load additional admins list from file
-    admin_file = os.path.join(DATA_DIR, "admins.json")
-    additional_admins = load_json(admin_file, [])
-    
-    # Check if target user is in additional admins (can be removed)
-    if user.id not in additional_admins:
-        # Check if they're a main admin or owner (cannot be removed)
-        if user.id in MAIN_ADMIN_IDS:
-            embed = discord.Embed(
-                title="❌ Cannot Remove Main Admin",
-                description=f"**{user.name}** is a main admin (defined in bot.py) and cannot be removed.",
-                color=discord.Color.red()
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-        elif user.id == OWNER_ID:
-            embed = discord.Embed(
-                title="❌ Cannot Remove Owner",
-                description=f"**{user.name}** is the bot owner and cannot be removed.",
-                color=discord.Color.red()
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-        else:
-            embed = discord.Embed(
-                title="❌ Not an Admin",
-                description=f"**{user.name}** is not an admin.",
-                color=discord.Color.orange()
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-    
-    # Remove the user from additional admins
-    additional_admins.remove(user.id)
-    save_json(admin_file, additional_admins)
-    
-    # Update global ADMIN_IDS (remove from runtime)
-    if user.id in ADMIN_IDS:
-        ADMIN_IDS.remove(user.id)
-    
-    await send_log("Admin Removed", interaction.user, None, f"Removed admin: {user.name}")
-    
-    # Create embed for response
-    embed = discord.Embed(
-        title="✅ Admin Removed",
-        description=f"**{user.name}** has been removed from admin privileges.",
-        color=discord.Color.green(),
-        timestamp=datetime.utcnow()
-    )
-    embed.add_field(name="Removed By", value=interaction.user.mention, inline=True)
-    embed.add_field(name="User", value=user.mention, inline=True)
-    embed.add_field(name="Remaining Additional Admins", value=f"`{len(additional_admins)}` users", inline=True)
-    embed.set_footer(text="Use /admins to view all admin users")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="admins", description="Show all admin users")
-async def admins_list(interaction: discord.Interaction):
-    """Show all admin users with clear distinction"""
-    admin_file = os.path.join(DATA_DIR, "admins.json")
-    additional_admins = load_json(admin_file, [])
-    
-    embed = discord.Embed(title="🛡️ Admin Users", color=discord.Color.blue(), timestamp=datetime.utcnow())
-    
-    # Owner
-    try:
-        owner = await bot.fetch_user(OWNER_ID)
-        embed.add_field(name="👑 Bot Owner", value=f"{owner.mention} (`{owner.id}`)\n*Cannot be removed*", inline=False)
-    except:
-        embed.add_field(name="👑 Bot Owner", value=f"User `{OWNER_ID}`\n*Cannot be removed*", inline=False)
-    
-    # Main Admins (hardcoded in bot.py)
-    main_admins = []
-    for admin_id in MAIN_ADMIN_IDS:
-        try:
-            user = await bot.fetch_user(admin_id)
-            main_admins.append(f"{user.mention} (`{user.id}`)")
-        except:
-            main_admins.append(f"User `{admin_id}`")
-    
-    if main_admins:
-        embed.add_field(name="🔐 Main Admins", value="\n".join(main_admins) + "\n*Defined in bot.py, cannot be removed*", inline=False)
-    
-    # Additional Admins (added via command)
-    command_admins = []
-    for admin_id in additional_admins:
-        try:
-            user = await bot.fetch_user(admin_id)
-            command_admins.append(f"{user.mention} (`{user.id}`)")
-        except:
-            command_admins.append(f"User `{admin_id}`")
-    
-    if command_admins:
-        embed.add_field(name="📋 Additional Admins", value="\n".join(command_admins) + f"\n*Added via command, can be removed*\n**Total:** `{len(command_admins)}` users", inline=False)
-    else:
-        embed.add_field(name="📋 Additional Admins", value="No additional admins\n*Use `/admin_add` to add more*", inline=False)
-    
-    embed.set_footer(text=f"Total Admin Users: {len(MAIN_ADMIN_IDS) + len(additional_admins) + 1}")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="set_log_channel", description="[ADMIN] Set channel for VPS logs")
-@app_commands.describe(channel="Channel to send logs to")
-async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    """[ADMIN] Set channel for professional VPS logs"""
-    if interaction.user.id not in ADMIN_IDS:
-        embed = discord.Embed(
-            title="❌ Permission Denied",
-            description="You need admin privileges to set the log channel.",
-            color=discord.Color.red()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    global LOG_CHANNEL_ID
-    LOG_CHANNEL_ID = channel.id
-    
-    # Save to config
-    config_file = os.path.join(DATA_DIR, "config.json")
-    config = load_json(config_file, {})
-    config['log_channel_id'] = channel.id
-    save_json(config_file, config)
-    
-    # Create success embed
-    embed = discord.Embed(
-        title="✅ Log Channel Configured",
-        description=f"**Log channel has been set to:** {channel.mention}",
-        color=discord.Color.green(),
-        timestamp=datetime.utcnow()
-    )
-    
-    embed.add_field(
-        name="📊 What will be logged:",
-        value="• VPS Deployments & Removals\n• VPS Start/Stop/Restart\n• VPS Renewals & Suspensions\n• Admin Actions\n• Point Transactions\n• Invite Claims\n• Port Management\n• Sharing Actions",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="👤 Set By:",
-        value=f"{interaction.user.mention}\n`{interaction.user.name}`",
-        inline=True
-    )
-    
-    embed.add_field(
-        name="📅 Configured At:",
-        value=f"<t:{int(datetime.utcnow().timestamp())}:F>",
-        inline=True
-    )
-    
-    embed.set_footer(text="All VPS activities will now be logged here")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-    
-    # Send test log to the new channel
-    await send_log(
-        "Log System Activated", 
-        interaction.user, 
-        details=f"Log channel configured by {interaction.user.name}\nAll future VPS activities will be logged here."
-    )
-
-# ============ ADD /logs COMMAND RIGHT HERE ============
-@bot.tree.command(name="logs", description="[ADMIN] View recent VPS activities")
-@app_commands.describe(limit="Number of logs to show (default: 10, max: 25)")
-async def view_logs(interaction: discord.Interaction, limit: int = 10):
-    """[ADMIN] View recent VPS activity logs"""
-    if interaction.user.id not in ADMIN_IDS:
-        embed = discord.Embed(
-            title="❌ Permission Denied",
-            description="You need admin privileges to view logs.",
-            color=discord.Color.red()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    if limit > 25:
-        limit = 25
-    if limit < 1:
-        limit = 10
-    
-    # Load logs
-    logs_file = os.path.join(DATA_DIR, "vps_logs.json")
-    logs_data = load_json(logs_file, [])
-    
-    if not logs_data:
-        embed = discord.Embed(
-            title="📊 VPS Activity Logs",
-            description="No logs found yet. Activities will appear here once they occur.",
-            color=discord.Color.blue()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    # Get recent logs
-    recent_logs = list(reversed(logs_data[-limit:]))
-    
-    # Create logs overview embed
-    embed = discord.Embed(
-        title="📊 VPS Activity Logs",
-        description=f"Showing last **{len(recent_logs)}** activities",
-        color=discord.Color.blue(),
-        timestamp=datetime.utcnow()
-    )
-    
-    # Add statistics
-    total_vps = len(vps_db)
-    active_vps = len([v for v in vps_db.values() if v['active']])
-    suspended_vps = len([v for v in vps_db.values() if v.get('suspended', False)])
-    total_users = len(users)
-    
-    embed.add_field(
-        name="📈 Current Statistics",
-        value=f"```\n🏠 Total VPS: {total_vps}\n🟢 Active: {active_vps}\n⏸️ Suspended: {suspended_vps}\n👥 Total Users: {total_users}\n```",
-        inline=False
-    )
-    
-    # Add recent activities
-    activities_text = ""
-    for i, log in enumerate(recent_logs, 1):
-        timestamp = log.get('timestamp', 'Unknown')
-        action = log.get('action', 'Unknown')
-        user = log.get('user', 'Unknown')
-        details = log.get('details', '')
-        
-        # Format timestamp nicely
-        try:
-            if isinstance(timestamp, str) and timestamp != 'Unknown':
-                time_display = f"<t:{int(datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp())}:R>"
-            else:
-                time_display = "Recently"
-        except:
-            time_display = "Recently"
-        
-        # Truncate long details
-        if len(details) > 50:
-            details = details[:47] + "..."
-        
-        activities_text += f"**{i}. {action}**\n"
-        activities_text += f"👤 `{user}` • ⏰ {time_display}\n"
-        if details:
-            activities_text += f"📝 `{details}`\n"
-        activities_text += "\n"
-    
-    if activities_text:
-        embed.add_field(
-            name="🔄 Recent Activities",
-            value=activities_text[:1024] if len(activities_text) > 1024 else activities_text,
-            inline=False
-        )
-    
-    embed.add_field(
-        name="🔧 Quick Actions",
-        value="• Use `/status` for detailed system status\n• Use `/listsall` to view all VPS\n• Use `/set_log_channel` to change log location",
-        inline=False
-    )
-    
-    embed.set_footer(
-        text=f"Requested by {interaction.user.name}",
-        icon_url=interaction.user.display_avatar.url
-    )
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="suspend", description="[ADMIN] Suspend a VPS")
-@app_commands.describe(container_id="Container ID to suspend")
-async def suspend_vps(interaction: discord.Interaction, container_id: str):
-    """[ADMIN] Suspend a VPS"""
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-        return
-    
-    cid = container_id.strip()
-    vps = vps_db.get(cid)
-    
-    if not vps:
-        await interaction.response.send_message("❌ VPS not found.", ephemeral=True)
-        return
-    
-    if vps.get('suspended', False):
-        await interaction.response.send_message("❌ VPS is already suspended.", ephemeral=True)
-        return
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    success = await docker_stop_container(cid)
-    if success:
-        vps['active'] = False
-        vps['suspended'] = True
-        persist_vps()
-        await send_log("VPS Suspended", interaction.user, cid, "Admin suspension")
-        await interaction.followup.send(f"✅ VPS `{cid}` suspended successfully.", ephemeral=True)
-    else:
-        await interaction.followup.send("❌ Failed to suspend VPS.", ephemeral=True)
-
-@bot.tree.command(name="unsuspend", description="[ADMIN] Unsuspend a VPS")
-@app_commands.describe(container_id="Container ID to unsuspend")
-async def unsuspend_vps(interaction: discord.Interaction, container_id: str):
-    """[ADMIN] Unsuspend a VPS"""
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-        return
-    
-    cid = container_id.strip()
-    vps = vps_db.get(cid)
-    
-    if not vps:
-        await interaction.response.send_message("❌ VPS not found.", ephemeral=True)
-        return
-    
-    if not vps.get('suspended', False):
-        await interaction.response.send_message("❌ VPS is not suspended.", ephemeral=True)
-        return
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    success = await docker_start_container(cid)
-    if success:
-        vps['active'] = True
-        vps['suspended'] = False
-        persist_vps()
-        await send_log("VPS Unsuspended", interaction.user, cid, "Admin unsuspension")
-        await interaction.followup.send(f"✅ VPS `{cid}` unsuspended successfully.", ephemeral=True)
-    else:
-        await interaction.followup.send("❌ Failed to unsuspend VPS.", ephemeral=True)
-
-@bot.tree.command(name="plan", description="View VPS plans and payment information")
-async def plan(interaction: discord.Interaction):
-    """View VPS plans and payment information"""
-    embed = discord.Embed(title="💰 VPS Plans", color=discord.Color.green())
-    
-    embed.add_field(
-        name="🎯 Basic Plan - ₹99",
-        value="• 16GB RAM\n• 6 CPU Cores\n• 100GB Disk\n• 15 Days Validity\n• Full Root Access\n• Systemctl Support\n• Pterodactyl Ready",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="💎 Premium Plan - ₹190", 
-        value="• 32GB RAM\n• 12 CPU Cores\n• 200GB Disk\n• 30 Days Validity\n• Priority Support\n• All Basic Features",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🚀 Ultimate Plan - ₹290",
-        value="• 64GB RAM\n• 24 CPU Cores\n• 500GB Disk\n• 60 Days Validity\n• Dedicated Resources\n• All Premium Features",
-        inline=False
-    )
-    
-    embed.set_image(url=QR_IMAGE)
-    embed.add_field(
-        name="📞 How to Purchase",
-        value="1. Scan the QR code above to make payment\n2. Take a screenshot of payment confirmation\n3. Create a ticket with your payment proof\n4. We'll activate your VPS within 24 hours\n5. Enjoy your high-performance VPS!",
-        inline=False
-    )
-    
-    embed.set_footer(text="Need help? Contact support or create a ticket!")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=False)
-
-@bot.tree.command(name="pointbal", description="Show your points balance")
-async def pointbal(interaction: discord.Interaction):
-    """Check your points balance"""
-    uid = str(interaction.user.id)
-    if uid not in users:
-        users[uid] = {"points": 0, "inv_unclaimed": 0, "inv_total": 0}
-        persist_users()
-    
-    embed = discord.Embed(title="💰 Your Points Balance", color=discord.Color.gold())
-    embed.add_field(name="Available Points", value=users[uid]['points'], inline=True)
-    embed.add_field(name="Unclaimed Invites", value=users[uid]['inv_unclaimed'], inline=True)
-    embed.add_field(name="Deploy Cost", value="4 points", inline=True)
-    
-    if users[uid]['points'] >= POINTS_PER_DEPLOY:
-        embed.add_field(name="Status", value="✅ Enough points to deploy", inline=False)
-    else:
-        embed.add_field(name="Status", value="❌ Not enough points to deploy", inline=False)
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="inv", description="Show your invites and points")
-async def inv(interaction: discord.Interaction):
-    """Check your invites and points with PROPER unique invite tracking"""
-    uid = str(interaction.user.id)
-    
-    # Initialize user if not exists
-    if uid not in users:
-        users[uid] = {
-            "points": 0, 
-            "inv_unclaimed": 0, 
-            "inv_total": 0, 
-            "invites": [],
-            "unique_joins": []  # This stores unique user IDs who joined
-        }
-        persist_users()
-    
-    user_data = users[uid]
-    unique_invites = len(user_data.get('unique_joins', []))
-    
-    # Create beautiful embed
-    embed = discord.Embed(
-        title="📊 Your Invites & Points Dashboard", 
-        color=discord.Color.purple(),
-        timestamp=datetime.utcnow()
-    )
-    
-    # Points Section
-    embed.add_field(
-        name="💰 **Points Balance**",
-        value=f"```\n🏆 Current Points: {user_data['points']}\n💎 Available Points: {user_data['inv_unclaimed']}\n📈 Total Earned: {user_data['points'] + user_data['inv_unclaimed']}\n```",
-        inline=False
-    )
-    
-    # Invites Section
-    embed.add_field(
-        name="📨 **Unique Invite Statistics**",
-        value=f"```\n✅ Unique Users Invited: {unique_invites}\n🆕 Unclaimed Invites: {user_data['inv_unclaimed']}\n🚫 Rejoins Ignored: Yes\n🎯 Conversion Rate: 1 invite = 1 point\n```",
-        inline=False
-    )
-    
-    # Recent Unique Joins
-    recent_joins = user_data.get('unique_joins', [])[-5:]
-    if recent_joins:
-        recent_text = ""
-        for user_id in recent_joins:
-            try:
-                user = await bot.fetch_user(int(user_id))
-                recent_text += f"• {user.name}\n"
-            except:
-                recent_text += f"• User {user_id}\n"
-        
-        embed.add_field(
-            name="👥 **Recently Invited**",
-            value=recent_text,
-            inline=False
-        )
-    
-    # Progress Section
-    points_needed = max(0, POINTS_PER_DEPLOY - user_data['points'])
-    points_percent = min((user_data['points'] / POINTS_PER_DEPLOY) * 100, 100)
-    progress_bar = "🟩" * int(points_percent / 20) + "⬛" * (5 - int(points_percent / 20))
-    
-    embed.add_field(
-        name="📈 **Deploy Progress**",
-        value=f"```\n{progress_bar} {points_percent:.1f}%\n{user_data['points']}/{POINTS_PER_DEPLOY} points\n🎯 Need {points_needed} more points\n```",
-        inline=False
-    )
-    
-    # Quick Actions
-    if user_data['inv_unclaimed'] > 0:
-        embed.add_field(
-            name="⚡ **Quick Action**",
-            value=f"Use `/claimpoint` to convert **{user_data['inv_unclaimed']} invites** → **{user_data['inv_unclaimed']} points**!",
-            inline=False
-        )
-    else:
-        embed.add_field(
-            name="💡 **How to Get Invites**",
-            value="• Share server invite links\n• Each **unique** user who joins = 1 invite\n• Rejoins are **not** counted\n• Invites never expire!",
-            inline=False
-        )
-    
-    # System Info
-    embed.add_field(
-        name="🛡️ **System Info**",
-        value="✅ **Unique Tracking**: Only counts new users\n✅ **No Rejoins**: Same user joining multiple times = 1 invite\n✅ **Permanent**: Invites never decrease\n✅ **Auto-Detect**: Real Discord invite tracking",
-        inline=False
-    )
-    
-    # Set visuals
-    embed.set_thumbnail(url=interaction.user.display_avatar.url)
-    embed.set_footer(
-        text=f"Total unique invites: {unique_invites} • Rejoins are ignored", 
-        icon_url=interaction.guild.icon.url if interaction.guild.icon else None
-    )
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="claimpoint", description="Convert invites to points (1 invite = 1 point)")
-async def claimpoint(interaction: discord.Interaction):
-    """Convert UNIQUE invites to points"""
-    uid = str(interaction.user.id)
-    if uid not in users:
-        users[uid] = {"points": 0, "inv_unclaimed": 0, "inv_total": 0, "unique_joins": []}
-        persist_users()
-    
-    user_data = users[uid]
-    
-    if user_data['inv_unclaimed'] > 0:
-        points_to_add = user_data['inv_unclaimed']
-        original_points = user_data['points']
-        claimed = user_data['inv_unclaimed']
-        
-        user_data['points'] += points_to_add
-        user_data['inv_unclaimed'] = 0
-        persist_users()
-        
-        # Success embed
-        embed = discord.Embed(
-            title="🎉 Unique Invites Converted!", 
-            color=discord.Color.green(),
-            timestamp=datetime.utcnow()
-        )
-        
-        embed.add_field(
-            name="📊 **Conversion Summary**",
-            value=f"```diff\n+ Unique Invites: {claimed}\n+ Points Added: {points_to_add}\n= New Balance: {user_data['points']} points\n```",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="🎯 **Progress Update**",
-            value=f"```\n📈 Before: {original_points} points\n📈 After: {user_data['points']} points\n🚀 Next Deploy: {max(0, POINTS_PER_DEPLOY - user_data['points'])} points needed\n```",
-            inline=False
-        )
-        
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.set_footer(text="Keep inviting unique users to earn more! 🚀")
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    else:
-        embed = discord.Embed(
-            title="❌ No Unique Invites to Claim", 
-            color=discord.Color.orange(),
-            timestamp=datetime.utcnow()
-        )
-        
-        embed.add_field(
-            name="📨 **Current Status**",
-            value=f"```\nUnique Invites: {len(user_data.get('unique_joins', []))}\nUnclaimed Invites: 0\nTotal Points: {user_data['points']}\n```",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="💡 **How to Get Invites**",
-            value="• Share server invite links\n• Get **new** users to join\n• Each **unique** join = 1 invite\n• Rejoins don't count (system ignores them)",
-            inline=False
-        )
-        
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.set_footer(text="Invite new users to earn points!")
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="point_share", description="Share your points with another user")
-@app_commands.describe(amount="Amount of points to share", user="User to share with")
-async def point_share(interaction: discord.Interaction, amount: int, user: discord.Member):
-    """Share points with another user"""
-    if amount <= 0:
-        await interaction.response.send_message("❌ Amount must be greater than 0.", ephemeral=True)
-        return
-    
-    if user.id == interaction.user.id:
-        await interaction.response.send_message("❌ You cannot share points with yourself.", ephemeral=True)
-        return
-    
-    sender_id = str(interaction.user.id)
-    receiver_id = str(user.id)
-    
-    # Initialize users if not exists
-    if sender_id not in users:
-        users[sender_id] = {"points": 0, "inv_unclaimed": 0, "inv_total": 0}
-    if receiver_id not in users:
-        users[receiver_id] = {"points": 0, "inv_unclaimed": 0, "inv_total": 0}
-    
-    if users[sender_id]['points'] < amount:
-        await interaction.response.send_message(f"❌ You don't have enough points. You have {users[sender_id]['points']} points.", ephemeral=True)
-        return
-    
-    # Transfer points
-    users[sender_id]['points'] -= amount
-    users[receiver_id]['points'] += amount
-    persist_users()
-    
-    embed = discord.Embed(title="💰 Points Shared Successfully!", color=discord.Color.green())
-    embed.add_field(name="From", value=interaction.user.mention, inline=True)
-    embed.add_field(name="To", value=user.mention, inline=True)
-    embed.add_field(name="Amount", value=f"{amount} points", inline=True)
-    embed.add_field(name="Your New Balance", value=f"{users[sender_id]['points']} points", inline=True)
-    embed.add_field(name="Their New Balance", value=f"{users[receiver_id]['points']} points", inline=True)
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-    
-    # Notify receiver
-    try:
-        receiver_embed = discord.Embed(title="💰 You Received Points!", color=discord.Color.gold())
-        receiver_embed.add_field(name="From", value=interaction.user.mention, inline=True)
-        receiver_embed.add_field(name="Amount", value=f"{amount} points", inline=True)
-        receiver_embed.add_field(name="Your New Balance", value=f"{users[receiver_id]['points']} points", inline=True)
-        await user.send(embed=receiver_embed)
-    except:
-        pass  # User has DMs disabled
-
-@bot.tree.command(name="pointtop", description="Show top 10 users by points")
-async def pointtop(interaction: discord.Interaction):
-    """Show points leaderboard"""
-    # Filter users with points and sort by points
-    users_with_points = [(uid, data) for uid, data in users.items() if data.get('points', 0) > 0]
-    sorted_users = sorted(users_with_points, key=lambda x: x[1]['points'], reverse=True)[:10]
-    
-    if not sorted_users:
-        await interaction.response.send_message("❌ No users with points found.", ephemeral=True)
-        return
-    
-    embed = discord.Embed(title="🏆 Points Leaderboard - Top 10", color=discord.Color.gold())
-    
-    for rank, (user_id, user_data) in enumerate(sorted_users, 1):
-        try:
-            user = await bot.fetch_user(int(user_id))
-            username = user.name
-        except:
-            username = f"User {user_id}"
-        
-        points = user_data['points']
-        medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"{rank}."
-        
-        embed.add_field(
-            name=f"{medal} {username}",
-            value=f"**{points} points**",
-            inline=False
-        )
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="giveaway_create", description="[ADMIN] Create a VPS giveaway")
-@app_commands.describe(
-    duration_minutes="Giveaway duration in minutes",
-    vps_ram="VPS RAM in GB",
-    vps_cpu="VPS CPU cores", 
-    vps_disk="VPS Disk in GB",
-    winner_type="Winner type: random or all",
-    description="Giveaway description"
-)
-async def giveaway_create(interaction: discord.Interaction, duration_minutes: int, vps_ram: int, vps_cpu: int, vps_disk: int, winner_type: str, description: str = "VPS Giveaway"):
-    """[ADMIN] Create a VPS giveaway"""
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-        return
-    
-    if winner_type not in ["random", "all"]:
-        await interaction.response.send_message("❌ Winner type must be 'random' or 'all'.", ephemeral=True)
-        return
-    
-    if duration_minutes < 1:
-        await interaction.response.send_message("❌ Duration must be at least 1 minute.", ephemeral=True)
-        return
-    
-    giveaway_id = f"giveaway_{random.randint(1000,9999)}"
-    end_time = datetime.utcnow() + timedelta(minutes=duration_minutes)
-    
-    giveaway = {
-        'id': giveaway_id,
-        'creator_id': str(interaction.user.id),
-        'description': description,
-        'vps_ram': vps_ram,
-        'vps_cpu': vps_cpu,
-        'vps_disk': vps_disk,
-        'winner_type': winner_type,
-        'end_time': end_time.isoformat(),
-        'status': 'active',
-        'participants': [],
-        'created_at': datetime.utcnow().isoformat()
-    }
-    
-    giveaways[giveaway_id] = giveaway
-    persist_giveaways()
-    
-    embed = discord.Embed(title="🎉 VPS Giveaway Created!", color=discord.Color.gold())
-    embed.add_field(name="Description", value=description, inline=False)
-    embed.add_field(name="VPS Specs", value=f"{vps_ram}GB RAM | {vps_cpu} CPU | {vps_disk}GB Disk", inline=False)
-    embed.add_field(name="Winner Type", value=winner_type.capitalize(), inline=True)
-    embed.add_field(name="Duration", value=f"{duration_minutes} minutes", inline=True)
-    embed.add_field(name="Ends At", value=end_time.strftime('%Y-%m-%d %H:%M UTC'), inline=False)
-    embed.set_footer(text="Click the button below to join the giveaway!")
-    
-    view = GiveawayView(giveaway_id)
-    await interaction.response.send_message(embed=embed, view=view)
-    
-    # Send admin confirmation
-    await interaction.followup.send(f"✅ Giveaway created with ID: `{giveaway_id}`", ephemeral=True)
-
-@bot.tree.command(name="giveaway_list", description="[ADMIN] List all giveaways")
-async def giveaway_list(interaction: discord.Interaction):
-    """[ADMIN] List all giveaways"""
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-        return
-    
-    if not giveaways:
-        await interaction.response.send_message("ℹ️ No giveaways found.", ephemeral=True)
-        return
-    
-    embed = discord.Embed(title="🎉 Active Giveaways", color=discord.Color.gold())
-    
-    active_giveaways = [g for g in giveaways.values() if g['status'] == 'active']
-    ended_giveaways = [g for g in giveaways.values() if g['status'] == 'ended']
-    
-    if active_giveaways:
-        embed.add_field(name="Active Giveaways", value=f"{len(active_giveaways)} active", inline=False)
-        for giveaway in list(active_giveaways)[:5]:
-            end_time = datetime.fromisoformat(giveaway['end_time'])
-            time_left = end_time - datetime.utcnow()
-            minutes_left = max(0, int(time_left.total_seconds() / 60))
-            
-            value = f"**Specs:** {giveaway['vps_ram']}GB/{giveaway['vps_cpu']}CPU/{giveaway['vps_disk']}GB\n"
-            value += f"**Participants:** {len(giveaway.get('participants', []))}\n"
-            value += f"**Ends in:** {minutes_left}m\n"
-            value += f"**Winner:** {giveaway['winner_type'].capitalize()}"
-            
-            embed.add_field(name=f"`{giveaway['id']}`", value=value, inline=True)
-    
-    if ended_giveaways:
-        embed.add_field(name="Ended Giveaways", value=f"{len(ended_giveaways)} ended", inline=False)
-        for giveaway in list(ended_giveaways)[:3]:
-            winner_info = "All participants" if giveaway['winner_type'] == 'all' else f"<@{giveaway.get('winner_id', 'N/A')}>"
-            vps_info = "✅ Created" if giveaway.get('vps_created') else "❌ Failed"
-            
-            value = f"**Winner:** {winner_info}\n"
-            value += f"**VPS:** {vps_info}\n"
-            value += f"**Participants:** {len(giveaway.get('participants', []))}"
-            
-            embed.add_field(name=f"`{giveaway['id']}`", value=value, inline=True)
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="pointgive", description="[ADMIN] Give points to a user")
-@app_commands.describe(amount="Amount of points to give", user="User to give points to")
-async def pointgive(interaction: discord.Interaction, amount: int, user: discord.Member):
-    """[ADMIN] Give points to a user"""
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-        return
-    
-    if amount <= 0:
-        await interaction.response.send_message("❌ Amount must be greater than 0.", ephemeral=True)
-        return
-    
-    user_id = str(user.id)
-    if user_id not in users:
-        users[user_id] = {"points": 0, "inv_unclaimed": 0, "inv_total": 0}
-    
-    users[user_id]['points'] += amount
-    persist_users()
-    
-    embed = discord.Embed(title="✅ Points Given", color=discord.Color.green())
-    embed.add_field(name="Admin", value=interaction.user.mention, inline=True)
-    embed.add_field(name="User", value=user.mention, inline=True)
-    embed.add_field(name="Amount", value=f"{amount} points", inline=True)
-    embed.add_field(name="New Balance", value=f"{users[user_id]['points']} points", inline=True)
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="pointremove", description="[ADMIN] Remove points from a user")
-@app_commands.describe(amount="Amount of points to remove", user="User to remove points from")
-async def pointremove(interaction: discord.Interaction, amount: int, user: discord.Member):
-    """[ADMIN] Remove points from a user"""
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-        return
-    
-    if amount <= 0:
-        await interaction.response.send_message("❌ Amount must be greater than 0.", ephemeral=True)
-        return
-    
-    user_id = str(user.id)
-    if user_id not in users:
-        users[user_id] = {"points": 0, "inv_unclaimed": 0, "inv_total": 0}
-    
-    if users[user_id]['points'] < amount:
-        amount = users[user_id]['points']  # Remove all points if not enough
-    
-    users[user_id]['points'] -= amount
-    persist_users()
-    
-    embed = discord.Embed(title="✅ Points Removed", color=discord.Color.orange())
-    embed.add_field(name="Admin", value=interaction.user.mention, inline=True)
-    embed.add_field(name="User", value=user.mention, inline=True)
-    embed.add_field(name="Amount", value=f"{amount} points", inline=True)
-    embed.add_field(name="New Balance", value=f"{users[user_id]['points']} points", inline=True)
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="pointlistall", description="[ADMIN] List all users with points")
-async def pointlistall(interaction: discord.Interaction):
-    """[ADMIN] List all users with points"""
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-        return
-    
-    # Filter users with points
-    users_with_points = [(uid, data) for uid, data in users.items() if data.get('points', 0) > 0]
-    
-    if not users_with_points:
-        await interaction.response.send_message("ℹ️ No users with points found.", ephemeral=True)
-        return
-    
-    embed = discord.Embed(title="📊 All Users with Points", color=discord.Color.blue())
-    
-    for user_id, user_data in sorted(users_with_points, key=lambda x: x[1]['points'], reverse=True)[:15]:
-        try:
-            user = await bot.fetch_user(int(user_id))
-            username = user.name
-        except:
-            username = f"User {user_id}"
-        
-        points = user_data['points']
-        embed.add_field(
-            name=username,
-            value=f"**{points} points**",
-            inline=True
-        )
-    
-    embed.set_footer(text=f"Total: {len(users_with_points)} users with points")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="listsall", description="[ADMIN] Show all VPS")
-async def listsall(interaction: discord.Interaction):
-    """[ADMIN] List all VPS in the system"""
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-        return
-    
-    if not vps_db:
-        await interaction.response.send_message("ℹ️ No VPS found.", ephemeral=True)
-        return
-    
-    embed = discord.Embed(title="All VPS (Admin View)", color=discord.Color.red())
-    for cid, vps in list(vps_db.items())[:10]:
-        try:
-            owner = await bot.fetch_user(int(vps['owner']))
-            owner_name = owner.name
-        except:
-            owner_name = f"User {vps['owner']}"
-            
-        status = "🟢 Running" if vps['active'] else "🔴 Stopped"
-        if vps.get('suspended', False):
-            status = "⏸️ Suspended"
-        
-        vps_type = "🎁 Giveaway" if vps.get('giveaway_vps') else "💎 Normal"
-        systemctl_status = "✅" if vps.get('systemctl_working') else "❌"
-        
-        value = f"**Owner:** {owner_name}\n"
-        value += f"**Specs:** {vps['ram']}GB | {vps['cpu']} CPU\n"
-        value += f"**Status:** {status} | **Type:** {vps_type}\n"
-        value += f"**Systemctl:** {systemctl_status} | **Expires:** {vps['expires_at'][:10]}"
-        
-        embed.add_field(name=f"Container: `{cid}`", value=value, inline=False)
-    
-    if len(vps_db) > 10:
-        embed.set_footer(text=f"Showing 10 of {len(vps_db)} VPS")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="create_vps", description="[ADMIN] Create VPS for user")
-@app_commands.describe(
-    ram_gb="RAM in GB", 
-    disk_gb="Disk in GB", 
-    cpu="CPU cores", 
-    user="Target user"
-)
-async def create_vps_admin(interaction: discord.Interaction, ram_gb: int, disk_gb: int, cpu: int, user: discord.Member):
-    """[ADMIN] Create a VPS for a user"""
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-        return
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    rec = await create_vps(user.id, ram=ram_gb, cpu=cpu, disk=disk_gb, paid=True)
-    if 'error' in rec:
-        await interaction.followup.send(f"❌ Error creating VPS: {rec['error']}", ephemeral=True)
-        return
-    
-    systemctl_status = "✅ Working" if rec.get('systemctl_working') else "⚠️ Limited"
-    
-    embed = discord.Embed(title="🛠️ Admin VPS Created", color=discord.Color.green())
-    embed.add_field(name="Container ID", value=f"`{rec['container_id']}`", inline=False)
-    embed.add_field(name="Specs", value=f"**{rec['ram']}GB RAM** | **{rec['cpu']} CPU** | **{rec['disk']}GB Disk**", inline=False)
-    embed.add_field(name="For User", value=user.mention, inline=False)
-    embed.add_field(name="Systemctl", value=systemctl_status, inline=True)
-    embed.add_field(name="Expires", value=rec['expires_at'][:10], inline=False)
-    embed.add_field(name="HTTP", value=f"http://{SERVER_IP}:{rec['http_port']}", inline=False)
-    embed.add_field(name="SSH", value=f"```{rec['ssh']}```", inline=False)
-    
-    try: 
-        await user.send(embed=embed)
-        await interaction.followup.send(f"✅ VPS created for {user.mention}. Check their DMs.", ephemeral=True)
-    except: 
-        await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="help", description="Show all available commands and their uses")
-async def help_command(interaction: discord.Interaction):
-    """Show help information for all commands"""
-    embed = discord.Embed(title="🤖 VPS Bot Help Guide", color=discord.Color.blue())
-    
-    # User Commands
-    user_commands = """
-    **🎯 VPS Management:**
-    `/deploy` - Deploy a new VPS (4 points)
-    `/list` - List your VPS
-    `/remove <container_id>` - Remove VPS & refund points
-    `/manage <container_id>` - Interactive VPS management
-    `/status` - Check VPS system status
-    
-    **🔧 New Features:**
-    `/port <container_id> <port>` - Add port to VPS
-    `/share_vps <container_id> <user>` - Share VPS access
-    `/share_remove <container_id> <user>` - Remove VPS share
-    
-    **💰 Points System:**
-    `/pointbal` - Check your points balance
-    `/inv` - Check invites & points
-    `/claimpoint` - Convert invites to points (1:1)
-    `/point_share <amount> <user>` - Share points with others
-    `/pointtop` - View points leaderboard
-    
-    **💸 Payment Plans:**
-    `/plan` - View VPS plans and payment options
-    """
-    
-    # Admin Commands
-    admin_commands = """
-    **🛠️ Admin VPS Controls:**
-    `/create_vps <ram> <disk> <cpu> <user>` - Create VPS for user
-    `/listsall` - List all VPS in system
-    `/mass_port <port> <container_ids>` - Add port to multiple VPS
-    `/suspend <container_id>` - Suspend VPS
-    `/unsuspend <container_id>` - Unsuspend VPS
-    
-    **👥 Admin Management:**
-    `/admin_add <user>` - Add admin user
-    `/admin_remove <user>` - Remove admin user
-    `/admins` - List all admins
-    `/set_log_channel <channel>` - Set log channel
-    
-    **🎁 Giveaway System:**
-    `/giveaway_create <duration> <ram> <cpu> <disk> <winner_type> <description>` - Create giveaway
-    `/giveaway_list` - List all giveaways
-    
-    **💰 Point Management:**
-    `/pointgive <amount> <user>` - Give points to user
-    `/pointremove <amount> <user>` - Remove points from user
-    `/pointlistall` - List all users with points
-    """
-    
-    embed.add_field(name="👤 User Commands", value=user_commands, inline=False)
-    embed.add_field(name="🛡️ Admin Commands", value=admin_commands, inline=False)
-    
-    embed.add_field(
-        name="📖 Quick Guide", 
-        value="• **Deploy Cost**: 4 points\n• **Renew Cost**: 3 points (15 days) / 5 points (30 days)\n• **VPS Specs**: 32GB RAM, 6 CPU, 100GB Disk\n• **Systemctl**: ✅ Now fully supported\n• **Auto Expiry**: VPS auto-suspend after expiry\n• **Giveaway VPS**: Cannot be renewed, auto-delete after 15 days\n• **Payment Plans**: Starting from ₹49",
-        inline=False
-    )
-    
-    embed.set_footer(text="Need help? Ask in support channel or contact admin.")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ---------------- Load Config on Start ----------------
-def load_config():
-    config_file = os.path.join(DATA_DIR, "config.json")
-    config = load_json(config_file, {})
-    
-    global LOG_CHANNEL_ID
-    LOG_CHANNEL_ID = config.get('log_channel_id')
-    
-    # Load additional admins and update global ADMIN_IDS
-    admin_file = os.path.join(DATA_DIR, "admins.json")
-    additional_admins = load_json(admin_file, [])
-    
-    global ADMIN_IDS
-    ADMIN_IDS = set(MAIN_ADMIN_IDS)  # Start with main admins
-    ADMIN_IDS.update(additional_admins)  # Add additional admins
-    if OWNER_ID not in ADMIN_IDS:
-        ADMIN_IDS.add(OWNER_ID)  # Ensure owner is always admin
-
-# ---------------- Start Bot ----------------
-if __name__ == "__main__":
-    # Load configuration
-    load_config()
-    
-    # Initialize data files
-    persist_users()
-    persist_vps()
-    save_json(INV_CACHE_FILE, invite_snapshot)
-    persist_giveaways()
-    persist_renew_mode()
-    
-    try:
-        bot.run(TOKEN)
-    except discord.LoginFailure:
-        logger.error("❌ INVALID BOT TOKEN! Please get a new token from Discord Developer Portal.")
+        await ctx.send(embed=embed)
     except Exception as e:
-        logger.error(f"❌ Bot failed to start: {e}")
+        logger.error(f"Error in list_vps: {e}")
+        await ctx.send(f"❌ Error listing VPS instances: {str(e)}")
+
+@bot.hybrid_command(name='vps_list', description='List all VPS instances (Admin only)')
+async def admin_list_vps(ctx):
+    """List all VPS instances (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        all_vps = bot.db.get_all_vps()
+        if not all_vps:
+            await ctx.send("No VPS instances found.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title="All HostForge VPS Instances", color=discord.Color.blue())
+        valid_vps_count = 0
+        
+        for token, vps in all_vps.items():
+            try:
+                # Fetch username of the owner with error handling
+                user = await bot.fetch_user(int(vps.get("created_by", "0")))
+                username = user.name if user else "Unknown User"
+            except Exception as e:
+                username = "Unknown User"
+                logger.error(f"Error fetching user {vps.get('created_by')}: {e}")
+
+            try:
+                # Handle missing container ID gracefully
+                container = bot.docker_client.containers.get(vps.get("container_id", "")) if vps.get("container_id") else None
+                container_status = container.status if container else "Not Found"
+            except Exception as e:
+                container_status = "Not Found"
+                logger.error(f"Error fetching container {vps.get('container_id')}: {e}")
+
+            # Get status and other info with error fallback
+            status = vps.get('status', "Unknown").capitalize()
+
+            vps_info = f"""
+Owner: {username}
+Status: {status} (Container: {container_status})
+Memory: {vps.get('memory', 'Unknown')}GB
+CPU: {vps.get('cpu', 'Unknown')} cores
+Disk: {vps.get('disk', 'Unknown')}GB
+Username: {vps.get('username', 'Unknown')}
+OS: {vps.get('os_image', DEFAULT_OS_IMAGE)}
+Created: {vps.get('created_at', 'Unknown')}
+Restarts: {vps.get('restart_count', 0)}
+SSH Port: {vps.get('external_ssh_port', 'Not set')}
+"""
+
+            embed.add_field(
+                name=f"VPS {vps.get('vps_id', 'Unknown')}",
+                value=vps_info,
+                inline=False
+            )
+            valid_vps_count += 1
+
+        if valid_vps_count == 0:
+            await ctx.send("No valid VPS instances found.", ephemeral=True)
+            return
+
+        embed.set_footer(text=f"Total VPS instances: {valid_vps_count}")
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Error in admin_list_vps: {e}")
+        await ctx.send(f"❌ Error listing VPS instances: {str(e)}")
+
+@bot.hybrid_command(name='delete_vps', description='Delete a VPS instance (Admin only)')
+@app_commands.describe(
+    vps_id="ID of the VPS to delete"
+)
+async def delete_vps(ctx, vps_id: str):
+    """Delete a VPS instance (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps:
+            await ctx.send("❌ VPS not found!", ephemeral=True)
+            return
+        
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            container.stop()
+            container.remove()
+            logger.info(f"Deleted container {vps['container_id']} for VPS {vps_id}")
+        except Exception as e:
+            logger.error(f"Error removing container: {e}")
+        
+        bot.db.remove_vps(token)
+        
+        await ctx.send(f"✅ HostForge VPS {vps_id} has been deleted successfully!")
+    except Exception as e:
+        logger.error(f"Error in delete_vps: {e}")
+        await ctx.send(f"❌ Error deleting VPS: {str(e)}")
+
+@bot.hybrid_command(name='connect_vps', description='Connect to a VPS using the provided token')
+@app_commands.describe(
+    token="Access token for the VPS"
+)
+async def connect_vps(ctx, token: str):
+    """Connect to a VPS using the provided token"""
+    vps = bot.db.get_vps_by_token(token)
+    if not vps:
+        await ctx.send("❌ Invalid token!", ephemeral=True)
+        return
+        
+    if str(ctx.author.id) != vps["created_by"] and not has_admin_role(ctx):
+        await ctx.send("❌ You don't have permission to access this VPS!", ephemeral=True)
+        return
+
+    try:
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            if container.status != "running":
+                container.start()
+                await asyncio.sleep(5)
+        except:
+            await ctx.send("❌ VPS instance not found or is no longer available.", ephemeral=True)
+            return
+
+        exec_cmd = await asyncio.create_subprocess_exec(
+            "docker", "exec", vps["container_id"], "tmate", "-F",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        ssh_session_line = await capture_ssh_session_line(exec_cmd)
+        if not ssh_session_line:
+            raise Exception("Failed to get tmate session")
+
+        bot.db.update_vps(token, {"tmate_session": ssh_session_line})
+        
+        embed = discord.Embed(title="HostForge VPS Connection Details", color=discord.Color.blue())
+        embed.add_field(name="Username", value=vps["username"], inline=True)
+        embed.add_field(name="SSH Password", value=f"||{vps.get('password', 'Not set')}||", inline=True)
+        embed.add_field(name="Tmate Session", value=f"```{ssh_session_line}```", inline=False)
+        embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
+        embed.add_field(name="Connection Instructions", value="""
+1. Copy the Tmate session command
+2. Open your terminal
+3. Paste and run the command
+4. You will be connected to your HostForge VPS
+
+Or use direct SSH with the provided command.
+""", inline=False)
+        
+        await ctx.author.send(embed=embed)
+        await ctx.send("✅ Connection details sent to your DMs! Use the Tmate command to connect to your HostForge VPS.", ephemeral=True)
+        
+    except discord.Forbidden:
+        await ctx.send("❌ I couldn't send you a DM. Please enable DMs from server members.", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in connect_vps: {e}")
+        await ctx.send(f"❌ An error occurred while connecting to the VPS: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='vps_stats', description='Show resource usage for a VPS')
+@app_commands.describe(
+    vps_id="ID of the VPS to check"
+)
+async def vps_stats(ctx, vps_id: str):
+    """Show resource usage for a VPS"""
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps or (vps["created_by"] != str(ctx.author.id) and not has_admin_role(ctx)):
+            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
+            return
+
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            if container.status != "running":
+                await ctx.send("❌ VPS is not running!", ephemeral=True)
+                return
+
+            # Get memory stats
+            mem_process = await asyncio.create_subprocess_exec(
+                "docker", "exec", vps["container_id"], "free", "-m",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await mem_process.communicate()
+            
+            if mem_process.returncode != 0:
+                raise Exception(f"Failed to get memory info: {stderr.decode()}")
+
+            # Get CPU stats
+            cpu_process = await asyncio.create_subprocess_exec(
+                "docker", "exec", vps["container_id"], "top", "-bn1",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            cpu_stdout, cpu_stderr = await cpu_process.communicate()
+
+            # Get disk stats
+            disk_process = await asyncio.create_subprocess_exec(
+                "docker", "exec", vps["container_id"], "df", "-h",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            disk_stdout, disk_stderr = await disk_process.communicate()
+
+            embed = discord.Embed(title=f"Resource Usage for VPS {vps_id}", color=discord.Color.blue())
+            embed.add_field(name="Memory Info", value=f"```{stdout.decode()}```", inline=False)
+            
+            if disk_process.returncode == 0:
+                embed.add_field(name="Disk Info", value=f"```{disk_stdout.decode()}```", inline=False)
+            
+            embed.add_field(name="Configured Limits", value=f"""
+Memory: {vps['memory']}GB
+CPU: {vps['cpu']} cores
+Disk Allocated: {vps['disk']}GB
+SSH Port: {vps['external_ssh_port']}
+""", inline=True)
+            
+            await ctx.send(embed=embed)
+        except Exception as e:
+            await ctx.send(f"❌ Error checking VPS stats: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in vps_stats: {e}")
+        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='change_ssh_password', description='Change the SSH password for a VPS')
+@app_commands.describe(
+    vps_id="ID of the VPS to update",
+    new_password="New SSH password"
+)
+async def change_ssh_password(ctx, vps_id: str, new_password: str):
+    """Change the SSH password for a VPS"""
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps or vps["created_by"] != str(ctx.author.id):
+            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
+            return
+
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            if container.status != "running":
+                await ctx.send("❌ VPS is not running!", ephemeral=True)
+                return
+            
+            process = await asyncio.create_subprocess_exec(
+                "docker", "exec", vps["container_id"], "bash", "-c", f"echo 'root:{new_password}' | chpasswd",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                raise Exception(f"Failed to change password: {stderr.decode()}")
+
+            bot.db.update_vps(token, {'password': new_password})
+            
+            embed = discord.Embed(title=f"SSH Password Updated for VPS {vps_id}", color=discord.Color.green())
+            embed.add_field(name="Username", value="root", inline=True)
+            embed.add_field(name="New Password", value=f"||{new_password}||", inline=False)
+            embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
+            
+            await ctx.author.send(embed=embed)
+            await ctx.send("✅ SSH password updated successfully! Check your DMs for the new password.", ephemeral=True)
+        except Exception as e:
+            await ctx.send(f"❌ Error changing SSH password: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in change_ssh_password: {e}")
+        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='admin_stats', description='Show system statistics (Admin only)')
+async def admin_stats(ctx):
+    """Show system statistics (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        # Get Docker stats
+        containers = bot.docker_client.containers.list(all=True) if bot.docker_client else []
+        
+        # Get system stats
+        stats = bot.system_stats
+        
+        embed = discord.Embed(title="HostForge System Statistics", color=discord.Color.blue())
+        embed.add_field(name="VPS Instances", value=f"Total: {len(bot.db.get_all_vps())}\nRunning: {len([c for c in containers if c.status == 'running'])}", inline=True)
+        embed.add_field(name="Docker Containers", value=f"Total: {len(containers)}\nRunning: {len([c for c in containers if c.status == 'running'])}", inline=True)
+        embed.add_field(name="CPU Usage", value=f"{stats['cpu_usage']}%", inline=True)
+        embed.add_field(name="Memory Usage", value=f"{stats['memory_usage']}% ({stats['memory_used']:.2f}GB / {stats['memory_total']:.2f}GB)", inline=True)
+        embed.add_field(name="Disk Usage", value=f"{stats['disk_usage']}% ({stats['disk_used']:.2f}GB / {stats['disk_total']:.2f}GB)", inline=True)
+        embed.add_field(name="Network", value=f"Sent: {stats['network_sent']:.2f}MB\nRecv: {stats['network_recv']:.2f}MB", inline=True)
+        embed.add_field(name="Container Limit", value=f"{len(containers)}/{bot.db.get_setting('max_containers')}", inline=True)
+        embed.add_field(name="Last Updated", value=f"<t:{int(stats['last_updated'])}:R>", inline=True)
+        
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Error in admin_stats: {e}")
+        await ctx.send(f"❌ Error getting system stats: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='system_info', description='Show detailed system information (Admin only)')
+async def system_info(ctx):
+    """Show detailed system information (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        # System information
+        uname = platform.uname()
+        boot_time = datetime.datetime.fromtimestamp(psutil.boot_time())
+        
+        # CPU information
+        cpu_info = f"""
+System: {uname.system}
+Node Name: {uname.node}
+Release: {uname.release}
+Version: {uname.version}
+Machine: {uname.machine}
+Processor: {uname.processor}
+Physical cores: {psutil.cpu_count(logical=False)}
+Total cores: {psutil.cpu_count(logical=True)}
+CPU Usage: {psutil.cpu_percent()}%
+"""
+        
+        # Memory Information
+        svmem = psutil.virtual_memory()
+        mem_info = f"""
+Total: {svmem.total / (1024**3):.2f}GB
+Available: {svmem.available / (1024**3):.2f}GB
+Used: {svmem.used / (1024**3):.2f}GB
+Percentage: {svmem.percent}%
+"""
+        
+        # Disk Information
+        partitions = psutil.disk_partitions()
+        disk_info = ""
+        for partition in partitions:
+            try:
+                partition_usage = psutil.disk_usage(partition.mountpoint)
+                disk_info += f"""
+Device: {partition.device}
+  Mountpoint: {partition.mountpoint}
+  File system type: {partition.fstype}
+  Total Size: {partition_usage.total / (1024**3):.2f}GB
+  Used: {partition_usage.used / (1024**3):.2f}GB
+  Free: {partition_usage.free / (1024**3):.2f}GB
+  Percentage: {partition_usage.percent}%
+"""
+            except PermissionError:
+                continue
+        
+        # Network information
+        net_io = psutil.net_io_counters()
+        net_info = f"""
+Bytes Sent: {net_io.bytes_sent / (1024**2):.2f}MB
+Bytes Received: {net_io.bytes_recv / (1024**2):.2f}MB
+"""
+        
+        embed = discord.Embed(title="Detailed System Information", color=discord.Color.blue())
+        embed.add_field(name="System", value=f"Boot Time: {boot_time}", inline=False)
+        embed.add_field(name="CPU Info", value=f"```{cpu_info}```", inline=False)
+        embed.add_field(name="Memory Info", value=f"```{mem_info}```", inline=False)
+        embed.add_field(name="Disk Info", value=f"```{disk_info}```", inline=False)
+        embed.add_field(name="Network Info", value=f"```{net_info}```", inline=False)
+        
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Error in system_info: {e}")
+        await ctx.send(f"❌ Error getting system info: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='container_limit', description='Set maximum container limit (Owner only)')
+@app_commands.describe(
+    max_limit="New maximum container limit"
+)
+async def set_container_limit(ctx, max_limit: int):
+    """Set maximum container limit (Owner only)"""
+    if ctx.author.id != 1027945222551900281:  # Only the owner can set limit
+        await ctx.send("❌ Only the owner can set container limit!", ephemeral=True)
+        return
+    
+    if max_limit < 1 or max_limit > 1000:
+        await ctx.send("❌ Container limit must be between 1 and 1000", ephemeral=True)
+        return
+    
+    bot.db.set_setting('max_containers', max_limit)
+    await ctx.send(f"✅ Maximum container limit set to {max_limit}", ephemeral=True)
+
+@bot.hybrid_command(name='cleanup_vps', description='Cleanup inactive VPS instances (Admin only)')
+async def cleanup_vps(ctx):
+    """Cleanup inactive VPS instances (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        cleanup_count = 0
+        
+        for token, vps in list(bot.db.get_all_vps().items()):
+            try:
+                container = bot.docker_client.containers.get(vps['container_id'])
+                if container.status != 'running':
+                    container.stop()
+                    container.remove()
+                    bot.db.remove_vps(token)
+                    cleanup_count += 1
+            except docker.errors.NotFound:
+                bot.db.remove_vps(token)
+                cleanup_count += 1
+            except Exception as e:
+                logger.error(f"Error cleaning up VPS {vps['vps_id']}: {e}")
+                continue
+        
+        if cleanup_count > 0:
+            await ctx.send(f"✅ Cleaned up {cleanup_count} inactive VPS instances!")
+        else:
+            await ctx.send("ℹ️ No inactive VPS instances found to clean up.")
+    except Exception as e:
+        logger.error(f"Error in cleanup_vps: {e}")
+        await ctx.send(f"❌ Error during cleanup: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='vps_shell', description='Get shell access to your VPS')
+@app_commands.describe(
+    vps_id="ID of the VPS to access"
+)
+async def vps_shell(ctx, vps_id: str):
+    """Get shell access to your VPS"""
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps or (vps["created_by"] != str(ctx.author.id) and not has_admin_role(ctx)):
+            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
+            return
+
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            if container.status != "running":
+                await ctx.send("❌ VPS is not running!", ephemeral=True)
+                return
+
+            await ctx.send(f"✅ Shell access to VPS {vps_id}:\n"
+                          f"```docker exec -it {vps['container_id']} bash```\n"
+                          f"Username: root\n"
+                          f"Password: ||{vps.get('password', 'Not set')}||", ephemeral=True)
+        except Exception as e:
+            await ctx.send(f"❌ Error accessing VPS shell: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in vps_shell: {e}")
+        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='vps_console', description='Get direct console access to your VPS')
+@app_commands.describe(
+    vps_id="ID of the VPS to access"
+)
+async def vps_console(ctx, vps_id: str):
+    """Get direct console access to your VPS"""
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps or (vps["created_by"] != str(ctx.author.id) and not has_admin_role(ctx)):
+            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
+            return
+
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            if container.status != "running":
+                await ctx.send("❌ VPS is not running!", ephemeral=True)
+                return
+
+            await ctx.send(f"✅ Console access to VPS {vps_id}:\n"
+                          f"```docker attach {vps['container_id']}```\n"
+                          f"Note: To detach from the console without stopping the container, use Ctrl+P followed by Ctrl+Q", 
+                          ephemeral=True)
+        except Exception as e:
+            await ctx.send(f"❌ Error accessing VPS console: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in vps_console: {e}")
+        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='run_command', description='Run a command in your VPS')
+@app_commands.describe(
+    vps_id="ID of the VPS",
+    command="Command to run"
+)
+async def run_command(ctx, vps_id: str, command: str):
+    """Run a command in your VPS"""
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps or (vps["created_by"] != str(ctx.author.id) and not has_admin_role(ctx)):
+            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
+            return
+
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            if container.status != "running":
+                await ctx.send("❌ VPS is not running!", ephemeral=True)
+                return
+
+            success, output = await run_docker_command(vps["container_id"], ["bash", "-c", command])
+            if success:
+                await ctx.send(f"✅ Command executed successfully:\n```{output}```", ephemeral=True)
+            else:
+                await ctx.send(f"❌ Command failed:\n```{output}```", ephemeral=True)
+        except Exception as e:
+            await ctx.send(f"❌ Error running command: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in run_command: {e}")
+        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='vps_usage', description='Show your VPS usage statistics')
+async def vps_usage(ctx):
+    """Show your VPS usage statistics"""
+    try:
+        user_vps = bot.db.get_user_vps(ctx.author.id)
+        
+        total_memory = sum(vps['memory'] for vps in user_vps)
+        total_cpu = sum(vps['cpu'] for vps in user_vps)
+        total_disk = sum(vps['disk'] for vps in user_vps)
+        total_restarts = sum(vps.get('restart_count', 0) for vps in user_vps)
+        
+        embed = discord.Embed(title="Your HostForge VPS Usage", color=discord.Color.blue())
+        embed.add_field(name="Total VPS Instances", value=len(user_vps), inline=True)
+        embed.add_field(name="Total Memory Allocated", value=f"{total_memory}GB", inline=True)
+        embed.add_field(name="Total CPU Cores Allocated", value=total_cpu, inline=True)
+        embed.add_field(name="Total Disk Allocated", value=f"{total_disk}GB", inline=True)
+        embed.add_field(name="Total Restarts", value=total_restarts, inline=True)
+        
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Error in vps_usage: {e}")
+        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='global_stats', description='Show global usage statistics (Admin only)')
+async def global_stats(ctx):
+    """Show global usage statistics (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        all_vps = bot.db.get_all_vps()
+        total_memory = sum(vps['memory'] for vps in all_vps.values())
+        total_cpu = sum(vps['cpu'] for vps in all_vps.values())
+        total_disk = sum(vps['disk'] for vps in all_vps.values())
+        total_restarts = sum(vps.get('restart_count', 0) for vps in all_vps.values())
+        
+        embed = discord.Embed(title="HostForge Global Usage Statistics", color=discord.Color.blue())
+        embed.add_field(name="Total VPS Created", value=bot.db.get_stat('total_vps_created'), inline=True)
+        embed.add_field(name="Total Restarts", value=bot.db.get_stat('total_restarts'), inline=True)
+        embed.add_field(name="Current VPS Instances", value=len(all_vps), inline=True)
+        embed.add_field(name="Total Memory Allocated", value=f"{total_memory}GB", inline=True)
+        embed.add_field(name="Total CPU Cores Allocated", value=total_cpu, inline=True)
+        embed.add_field(name="Total Disk Allocated", value=f"{total_disk}GB", inline=True)
+        embed.add_field(name="Total Restarts", value=total_restarts, inline=True)
+        
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Error in global_stats: {e}")
+        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='migrate_vps', description='Migrate a VPS to another host (Admin only)')
+@app_commands.describe(
+    vps_id="ID of the VPS to migrate"
+)
+async def migrate_vps(ctx, vps_id: str):
+    """Migrate a VPS to another host (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps:
+            await ctx.send("❌ VPS not found!", ephemeral=True)
+            return
+
+        status_msg = await ctx.send(f"🔄 Preparing to migrate VPS {vps_id}...")
+        
+        # Create a snapshot
+        backup_id = generate_vps_id()[:8]
+        backup_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        backup_dir = f"migrations/{vps_id}"
+        os.makedirs(backup_dir, exist_ok=True)
+        backup_file = f"{backup_dir}/{backup_id}.tar"
+        
+        await status_msg.edit(content=f"🔄 Creating snapshot {backup_id} for migration...")
+        
+        process = await asyncio.create_subprocess_exec(
+            "docker", "export", "-o", backup_file, vps["container_id"],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            raise Exception(f"Snapshot failed: {stderr.decode()}")
+        
+        await status_msg.edit(content=f"✅ Snapshot {backup_id} created successfully. Please download this file and import it on the new host: {backup_file}")
+        
+    except Exception as e:
+        logger.error(f"Error in migrate_vps: {e}")
+        await ctx.send(f"❌ Error during migration: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='emergency_stop', description='Force stop a problematic VPS (Admin only)')
+@app_commands.describe(
+    vps_id="ID of the VPS to stop"
+)
+async def emergency_stop(ctx, vps_id: str):
+    """Force stop a problematic VPS (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps:
+            await ctx.send("❌ VPS not found!", ephemeral=True)
+            return
+
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            if container.status != "running":
+                await ctx.send("VPS is already stopped!", ephemeral=True)
+                return
+            
+            await ctx.send("⚠️ Attempting to force stop the VPS... This may take a moment.", ephemeral=True)
+            
+            # Try normal stop first
+            try:
+                container.stop(timeout=10)
+                bot.db.update_vps(token, {'status': 'stopped'})
+                await ctx.send("✅ VPS stopped successfully!", ephemeral=True)
+                return
+            except:
+                pass
+            
+            # If normal stop failed, try killing the container
+            try:
+                subprocess.run(["docker", "kill", vps["container_id"]], check=True)
+                bot.db.update_vps(token, {'status': 'stopped'})
+                await ctx.send("✅ VPS killed forcefully!", ephemeral=True)
+            except subprocess.CalledProcessError as e:
+                raise Exception(f"Failed to kill container: {e}")
+            
+        except Exception as e:
+            await ctx.send(f"❌ Error stopping VPS: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in emergency_stop: {e}")
+        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='emergency_remove', description='Force remove a problematic VPS (Admin only)')
+@app_commands.describe(
+    vps_id="ID of the VPS to remove"
+)
+async def emergency_remove(ctx, vps_id: str):
+    """Force remove a problematic VPS (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps:
+            await ctx.send("❌ VPS not found!", ephemeral=True)
+            return
+
+        try:
+            # First try to stop the container
+            try:
+                container = bot.docker_client.containers.get(vps["container_id"])
+                container.stop()
+            except:
+                pass
+            
+            # Then remove it forcefully
+            try:
+                subprocess.run(["docker", "rm", "-f", vps["container_id"]], check=True)
+            except subprocess.CalledProcessError as e:
+                raise Exception(f"Failed to remove container: {e}")
+            
+            # Remove from data
+            bot.db.remove_vps(token)
+            
+            await ctx.send("✅ VPS removed forcefully!", ephemeral=True)
+        except Exception as e:
+            await ctx.send(f"❌ Error removing VPS: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in emergency_remove: {e}")
+        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='suspend_vps', description='Suspend a VPS (Admin only)')
+@app_commands.describe(
+    vps_id="ID of the VPS to suspend"
+)
+async def suspend_vps(ctx, vps_id: str):
+    """Suspend a VPS (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps:
+            await ctx.send("❌ VPS not found!", ephemeral=True)
+            return
+
+        if vps['status'] == 'suspended':
+            await ctx.send("❌ VPS is already suspended!", ephemeral=True)
+            return
+
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            container.stop()
+        except Exception as e:
+            logger.error(f"Error stopping container for suspend: {e}")
+
+        bot.db.update_vps(token, {'status': 'suspended'})
+        await ctx.send(f"✅ VPS {vps_id} has been suspended!")
+
+        # Notify owner
+        try:
+            owner = await bot.fetch_user(int(vps['created_by']))
+            await owner.send(f"⚠️ Your VPS {vps_id} has been suspended by an admin. Contact support for details.")
+        except:
+            pass
+
+    except Exception as e:
+        logger.error(f"Error in suspend_vps: {e}")
+        await ctx.send(f"❌ Error suspending VPS: {str(e)}")
+
+@bot.hybrid_command(name='unsuspend_vps', description='Unsuspend a VPS (Admin only)')
+@app_commands.describe(
+    vps_id="ID of the VPS to unsuspend"
+)
+async def unsuspend_vps(ctx, vps_id: str):
+    """Unsuspend a VPS (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps:
+            await ctx.send("❌ VPS not found!", ephemeral=True)
+            return
+
+        if vps['status'] != 'suspended':
+            await ctx.send("❌ VPS is not suspended!", ephemeral=True)
+            return
+
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            container.start()
+        except Exception as e:
+            logger.error(f"Error starting container for unsuspend: {e}")
+            await ctx.send(f"❌ Error starting container: {str(e)}")
+            return
+
+        bot.db.update_vps(token, {'status': 'running'})
+        await ctx.send(f"✅ VPS {vps_id} has been unsuspended!")
+
+        # Notify owner
+        try:
+            owner = await bot.fetch_user(int(vps['created_by']))
+            await owner.send(f"✅ Your VPS {vps_id} has been unsuspended by an admin.")
+        except:
+            pass
+
+    except Exception as e:
+        logger.error(f"Error in unsuspend_vps: {e}")
+        await ctx.send(f"❌ Error unsuspending VPS: {str(e)}")
+
+@bot.hybrid_command(name='edit_vps', description='Edit VPS specifications (Admin only)')
+@app_commands.describe(
+    vps_id="ID of the VPS to edit",
+    memory="New memory in GB (optional)",
+    cpu="New CPU cores (optional)",
+    disk="New disk space in GB (optional)"
+)
+async def edit_vps(ctx, vps_id: str, memory: Optional[int] = None, cpu: Optional[int] = None, disk: Optional[int] = None):
+    """Edit VPS specifications (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    if memory is None and cpu is None and disk is None:
+        await ctx.send("❌ At least one specification to edit must be provided!", ephemeral=True)
+        return
+
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps:
+            await ctx.send("❌ VPS not found!", ephemeral=True)
+            return
+
+        updates = {}
+        if memory is not None:
+            if memory < 1 or memory > 512:
+                await ctx.send("❌ Memory must be between 1GB and 512GB", ephemeral=True)
+                return
+            updates['memory'] = memory
+        if cpu is not None:
+            if cpu < 1 or cpu > 32:
+                await ctx.send("❌ CPU cores must be between 1 and 32", ephemeral=True)
+                return
+            updates['cpu'] = cpu
+        if disk is not None:
+            if disk < 10 or disk > 1000:
+                await ctx.send("❌ Disk space must be between 10GB and 1000GB", ephemeral=True)
+                return
+            updates['disk'] = disk
+
+        # Restart container with new limits
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            container.stop()
+            container.remove()
+
+            memory_bytes = (memory or vps['memory']) * 1024 * 1024 * 1024
+            cpu_quota = int((cpu or vps['cpu']) * 100000)
+
+            new_container = bot.docker_client.containers.run(
+                vps['os_image'],
+                detach=True,
+                privileged=True,
+                hostname=f"hostforge-{vps_id}",
+                mem_limit=memory_bytes,
+                cpu_period=100000,
+                cpu_quota=cpu_quota,
+                cap_add=["ALL"],
+                command="tail -f /dev/null",
+                tty=True,
+                network=DOCKER_NETWORK,
+                ports={'22/tcp': str(vps['external_ssh_port'])},
+                volumes={
+                    f'hostforge-{vps_id}': {'bind': '/data', 'mode': 'rw'}
+                },
+                restart_policy={"Name": "always"}
+            )
+
+            updates['container_id'] = new_container.id
+            await asyncio.sleep(5)
+            setup_success, _ = await setup_container(
+                new_container.id, 
+                ctx, 
+                memory or vps['memory'], 
+                vps_id=vps_id,
+                use_custom_image=vps['use_custom_image']
+            )
+            if not setup_success:
+                raise Exception("Failed to setup new container")
+        except Exception as e:
+            await ctx.send(f"❌ Error updating container: {str(e)}")
+            return
+
+        bot.db.update_vps(token, updates)
+        await ctx.send(f"✅ VPS {vps_id} specifications updated successfully!")
+
+    except Exception as e:
+        logger.error(f"Error in edit_vps: {e}")
+        await ctx.send(f"❌ Error editing VPS: {str(e)}")
+
+@bot.hybrid_command(name='ban_user', description='Ban a user from creating VPS (Admin only)')
+@app_commands.describe(
+    user="User to ban"
+)
+async def ban_user(ctx, user: discord.User):
+    """Ban a user from creating VPS (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    bot.db.ban_user(user.id)
+    await ctx.send(f"✅ {user.mention} has been banned from creating VPS!")
+
+@bot.hybrid_command(name='unban_user', description='Unban a user (Admin only)')
+@app_commands.describe(
+    user="User to unban"
+)
+async def unban_user(ctx, user: discord.User):
+    """Unban a user (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    bot.db.unban_user(user.id)
+    await ctx.send(f"✅ {user.mention} has been unbanned!")
+
+@bot.hybrid_command(name='list_banned', description='List banned users (Admin only)')
+async def list_banned(ctx):
+    """List banned users (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    banned = bot.db.get_banned_users()
+    if not banned:
+        await ctx.send("No banned users.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="Banned Users", color=discord.Color.red())
+    banned_list = []
+    for user_id in banned:
+        try:
+            user = await bot.fetch_user(int(user_id))
+            banned_list.append(f"{user.name} ({user_id})")
+        except:
+            banned_list.append(f"Unknown ({user_id})")
+    embed.description = "\n".join(banned_list)
+    await ctx.send(embed=embed, ephemeral=True)
+
+@bot.hybrid_command(name='backup_data', description='Backup all bot data (Admin only)')
+async def backup_data(ctx):
+    """Backup all bot data (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        if bot.db.backup_data():
+            await ctx.send("✅ Data backup completed successfully!", ephemeral=True)
+        else:
+            await ctx.send("❌ Failed to backup data!", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in backup_data: {e}")
+        await ctx.send(f"❌ Error backing up data: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='restore_data', description='Restore from backup (Admin only)')
+async def restore_data(ctx):
+    """Restore from backup (Admin only)"""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        if bot.db.restore_data():
+            await ctx.send("✅ Data restore completed successfully!", ephemeral=True)
+        else:
+            await ctx.send("❌ Failed to restore data!", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in restore_data: {e}")
+        await ctx.send(f"❌ Error restoring data: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='reinstall_bot', description='Reinstall the bot (Owner only)')
+async def reinstall_bot(ctx):
+    """Reinstall the bot (Owner only)"""
+    if ctx.author.id != 1210291131301101618:  # Only the owner can reinstall
+        await ctx.send("❌ Only the owner can reinstall the bot!", ephemeral=True)
+        return
+
+    try:
+        await ctx.send("🔄 Reinstalling HostForge bot... This may take a few minutes.")
+        
+        # Create Dockerfile for bot reinstallation
+        dockerfile_content = f"""
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    docker.io \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy bot code
+COPY . .
+
+# Start the bot
+CMD ["python", "bot.py"]
+"""
+        
+        with open("Dockerfile.bot", "w") as f:
+            f.write(dockerfile_content)
+        
+        # Build and run the bot in a container
+        process = await asyncio.create_subprocess_exec(
+            "docker", "build", "-t", "hostforge-bot", "-f", "Dockerfile.bot", ".",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            raise Exception(f"Failed to build bot image: {stderr.decode()}")
+        
+        await ctx.send("✅ Bot reinstalled successfully! Restarting...")
+        
+        # Restart the bot
+        os._exit(0)
+        
+    except Exception as e:
+        logger.error(f"Error in reinstall_bot: {e}")
+        await ctx.send(f"❌ Error reinstalling bot: {str(e)}", ephemeral=True)
+
+class VPSManagementView(ui.View):
+    def __init__(self, vps_id, container_id):
+        super().__init__(timeout=300)
+        self.vps_id = vps_id
+        self.container_id = container_id
+        self.original_message = None
+
+    async def handle_missing_container(self, interaction: discord.Interaction):
+        token, _ = bot.db.get_vps_by_id(self.vps_id)
+        if token:
+            bot.db.remove_vps(token)
+        
+        embed = discord.Embed(title=f"HostForge VPS Management - {self.vps_id}", color=discord.Color.red())
+        embed.add_field(name="Status", value="🔴 Container Not Found", inline=True)
+        embed.add_field(name="Note", value="This VPS instance is no longer available. Please create a new one.", inline=False)
+        
+        for item in self.children:
+            item.disabled = True
+        
+        await interaction.message.edit(embed=embed, view=self)
+        await interaction.response.send_message("❌ This VPS instance is no longer available. Please create a new one.", ephemeral=True)
+
+    @discord.ui.button(label="Start VPS", style=discord.ButtonStyle.green)
+    async def start_vps(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            
+            try:
+                container = bot.docker_client.containers.get(self.container_id)
+            except docker.errors.NotFound:
+                await self.handle_missing_container(interaction)
+                return
+            
+            token, vps = bot.db.get_vps_by_id(self.vps_id)
+            if vps['status'] == 'suspended':
+                await interaction.followup.send("❌ This VPS is suspended. Contact admin to unsuspend.", ephemeral=True)
+                return
+
+            if container.status == "running":
+                await interaction.followup.send("VPS is already running!", ephemeral=True)
+                return
+            
+            container.start()
+            await asyncio.sleep(5)
+            
+            if token:
+                bot.db.update_vps(token, {'status': 'running'})
+            
+            embed = discord.Embed(title=f"HostForge VPS Management - {self.vps_id}", color=discord.Color.green())
+            embed.add_field(name="Status", value="🟢 Running", inline=True)
+            
+            if vps:
+                embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
+                embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
+                embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
+                embed.add_field(name="Username", value=vps['username'], inline=True)
+                embed.add_field(name="Created", value=vps['created_at'], inline=True)
+            
+            await interaction.message.edit(embed=embed)
+            await interaction.followup.send("✅ HostForge VPS started successfully!", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error starting VPS: {str(e)}", ephemeral=True)
+
+    @discord.ui.button(label="Stop VPS", style=discord.ButtonStyle.red)
+    async def stop_vps(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            
+            try:
+                container = bot.docker_client.containers.get(self.container_id)
+            except docker.errors.NotFound:
+                await self.handle_missing_container(interaction)
+                return
+            
+            if container.status != "running":
+                await interaction.followup.send("VPS is already stopped!", ephemeral=True)
+                return
+            
+            container.stop()
+            
+            token, vps = bot.db.get_vps_by_id(self.vps_id)
+            if token:
+                bot.db.update_vps(token, {'status': 'stopped'})
+            
+            embed = discord.Embed(title=f"HostForge VPS Management - {self.vps_id}", color=discord.Color.orange())
+            embed.add_field(name="Status", value="🔴 Stopped", inline=True)
+            
+            if vps:
+                embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
+                embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
+                embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
+                embed.add_field(name="Username", value=vps['username'], inline=True)
+                embed.add_field(name="Created", value=vps['created_at'], inline=True)
+            
+            await interaction.message.edit(embed=embed)
+            await interaction.followup.send("✅ HostForge VPS stopped successfully!", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error stopping VPS: {str(e)}", ephemeral=True)
+
+    @discord.ui.button(label="Restart VPS", style=discord.ButtonStyle.blurple)
+    async def restart_vps(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            
+            try:
+                container = bot.docker_client.containers.get(self.container_id)
+            except docker.errors.NotFound:
+                await self.handle_missing_container(interaction)
+                return
+            
+            token, vps = bot.db.get_vps_by_id(self.vps_id)
+            if vps['status'] == 'suspended':
+                await interaction.followup.send("❌ This VPS is suspended. Contact admin to unsuspend.", ephemeral=True)
+                return
+
+            container.restart()
+            await asyncio.sleep(5)
+            
+            # Update restart count in VPS data
+            if token:
+                updates = {
+                    'restart_count': vps.get('restart_count', 0) + 1,
+                    'last_restart': str(datetime.datetime.now()),
+                    'status': 'running'
+                }
+                bot.db.update_vps(token, updates)
+                
+                bot.db.increment_stat('total_restarts')
+                
+                # Get new SSH session
+                try:
+                    exec_cmd = await asyncio.create_subprocess_exec(
+                        "docker", "exec", self.container_id, "tmate", "-F",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+
+                    ssh_session_line = await capture_ssh_session_line(exec_cmd)
+                    if ssh_session_line:
+                        bot.db.update_vps(token, {'tmate_session': ssh_session_line})
+                        
+                        # Send new SSH details to owner
+                        try:
+                            owner = await bot.fetch_user(int(vps["created_by"]))
+                            embed = discord.Embed(title=f"HostForge VPS Restarted - {self.vps_id}", color=discord.Color.blue())
+                            embed.add_field(name="New SSH Session", value=f"```{ssh_session_line}```", inline=False)
+                            embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
+                            await owner.send(embed=embed)
+                        except:
+                            pass
+                except:
+                    pass
+            
+            embed = discord.Embed(title=f"HostForge VPS Management - {self.vps_id}", color=discord.Color.green())
+            embed.add_field(name="Status", value="🟢 Running", inline=True)
+            
+            if vps:
+                embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
+                embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
+                embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
+                embed.add_field(name="Username", value=vps['username'], inline=True)
+                embed.add_field(name="Created", value=vps['created_at'], inline=True)
+                embed.add_field(name="Restart Count", value=vps.get('restart_count', 0) + 1, inline=True)
+            
+            await interaction.message.edit(embed=embed, view=VPSManagementView(self.vps_id, container.id))
+            await interaction.followup.send("✅ HostForge VPS restarted successfully! New SSH details sent to owner.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error restarting VPS: {str(e)}", ephemeral=True)
+
+    @discord.ui.button(label="Reinstall OS", style=discord.ButtonStyle.grey)
+    async def reinstall_os(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            try:
+                container = bot.docker_client.containers.get(self.container_id)
+            except docker.errors.NotFound:
+                await self.handle_missing_container(interaction)
+                return
+            
+            view = OSSelectionView(self.vps_id, self.container_id, interaction.message)
+            await interaction.response.send_message("Select new OS:", view=view, ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
+
+    @discord.ui.button(label="Transfer VPS", style=discord.ButtonStyle.grey)
+    async def transfer_vps(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = TransferVPSModal(self.vps_id)
+        await interaction.response.send_modal(modal)
+
+class OSSelectionView(ui.View):
+    def __init__(self, vps_id, container_id, original_message):
+        super().__init__(timeout=300)
+        self.vps_id = vps_id
+        self.container_id = container_id
+        self.original_message = original_message
+        
+        self.add_os_button("Ubuntu 22.04", "ubuntu:22.04")
+        self.add_os_button("Debian 12", "debian:12")
+        self.add_os_button("Arch Linux", "archlinux:latest")
+        self.add_os_button("Alpine", "alpine:latest")
+        self.add_os_button("CentOS 7", "centos:7")
+        self.add_os_button("Fedora 38", "fedora:38")
+
+    def add_os_button(self, label: str, image: str):
+        button = discord.ui.Button(label=label, style=discord.ButtonStyle.grey)
+        
+        async def os_callback(interaction: discord.Interaction):
+            await self.reinstall_os(interaction, image)
+        
+        button.callback = os_callback
+        self.add_item(button)
+
+    async def reinstall_os(self, interaction: discord.Interaction, image: str):
+        try:
+            token, vps = bot.db.get_vps_by_id(self.vps_id)
+            if not vps:
+                await interaction.response.send_message("❌ VPS not found!", ephemeral=True)
+                return
+
+            await interaction.response.defer(ephemeral=True)
+
+            try:
+                old_container = bot.docker_client.containers.get(self.container_id)
+                old_container.stop()
+                old_container.remove()
+            except Exception as e:
+                logger.error(f"Error removing old container: {e}")
+
+            status_msg = await interaction.followup.send("🔄 Reinstalling HostForge VPS... This may take a few minutes.", ephemeral=True)
+            
+            memory_bytes = vps['memory'] * 1024 * 1024 * 1024
+
+            try:
+                container = bot.docker_client.containers.run(
+                    image,
+                    detach=True,
+                    privileged=True,
+                    hostname=f"hostforge-{self.vps_id}",
+                    mem_limit=memory_bytes,
+                    cpu_period=100000,
+                    cpu_quota=int(vps['cpu'] * 100000),
+                    cap_add=["ALL"],
+                    command="tail -f /dev/null",
+                    tty=True,
+                    network=DOCKER_NETWORK,
+                    ports={'22/tcp': str(vps['external_ssh_port'])},
+                    volumes={
+                        f'hostforge-{self.vps_id}': {'bind': '/data', 'mode': 'rw'}
+                    }
+                )
+            except docker.errors.ImageNotFound:
+                await status_msg.edit(content=f"❌ OS image {image} not found. Using default {DEFAULT_OS_IMAGE}")
+                container = bot.docker_client.containers.run(
+                    DEFAULT_OS_IMAGE,
+                    detach=True,
+                    privileged=True,
+                    hostname=f"hostforge-{self.vps_id}",
+                    mem_limit=memory_bytes,
+                    cpu_period=100000,
+                    cpu_quota=int(vps['cpu'] * 100000),
+                    cap_add=["ALL"],
+                    command="tail -f /dev/null",
+                    tty=True,
+                    network=DOCKER_NETWORK,
+                    ports={'22/tcp': str(vps['external_ssh_port'])},
+                    volumes={
+                        f'hostforge-{self.vps_id}': {'bind': '/data', 'mode': 'rw'}
+                    }
+                )
+                image = DEFAULT_OS_IMAGE
+
+            bot.db.update_vps(token, {
+                'container_id': container.id,
+                'os_image': image
+            })
+
+            try:
+                setup_success, _ = await setup_container(
+                    container.id, 
+                    status_msg, 
+                    vps['memory'], 
+                    vps_id=self.vps_id
+                )
+                if not setup_success:
+                    raise Exception("Failed to setup container")
+                
+                bot.db.update_vps(token, {'password': "root"})
+            except Exception as e:
+                await status_msg.edit(content=f"❌ Container setup failed: {str(e)}")
+                return
+
+            try:
+                exec_cmd = await asyncio.create_subprocess_exec(
+                    "docker", "exec", container.id, "tmate", "-F",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+
+                ssh_session_line = await capture_ssh_session_line(exec_cmd)
+                if ssh_session_line:
+                    bot.db.update_vps(token, {'tmate_session': ssh_session_line})
+                    
+                    # Send new SSH details to owner
+                    try:
+                        owner = await bot.fetch_user(int(vps["created_by"]))
+                        embed = discord.Embed(title=f"HostForge VPS Reinstalled - {self.vps_id}", color=discord.Color.blue())
+                        embed.add_field(name="New OS", value=image, inline=True)
+                        embed.add_field(name="New SSH Session", value=f"```{ssh_session_line}```", inline=False)
+                        embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
+                        embed.add_field(name="Password", value=f"||root||", inline=False)
+                        await owner.send(embed=embed)
+                    except:
+                        pass
+            except Exception as e:
+                logger.error(f"Warning: Failed to start tmate session: {e}")
+
+            await status_msg.edit(content="✅ HostForge VPS reinstalled successfully!")
+            
+            try:
+                embed = discord.Embed(title=f"HostForge VPS Management - {self.vps_id}", color=discord.Color.green())
+                embed.add_field(name="Status", value="🟢 Running", inline=True)
+                embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
+                embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
+                embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
+                embed.add_field(name="Username", value="root", inline=True)
+                embed.add_field(name="Created", value=vps['created_at'], inline=True)
+                embed.add_field(name="OS", value=image, inline=True)
+                
+                await self.original_message.edit(embed=embed, view=VPSManagementView(self.vps_id, container.id))
+            except Exception as e:
+                logger.error(f"Warning: Failed to update original message: {e}")
+
+        except Exception as e:
+            try:
+                await interaction.followup.send(f"❌ Error reinstalling VPS: {str(e)}", ephemeral=True)
+            except:
+                try:
+                    channel = interaction.channel
+                    await channel.send(f"❌ Error reinstalling HostForge VPS {self.vps_id}: {str(e)}")
+                except:
+                    logger.error(f"Failed to send error message: {e}")
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        try:
+            await self.original_message.edit(view=self)
+        except:
+            pass
+
+class TransferVPSModal(ui.Modal, title='Transfer VPS'):
+    def __init__(self, vps_id: str):
+        super().__init__()
+        self.vps_id = vps_id
+        self.new_owner = ui.TextInput(
+            label='New Owner',
+            placeholder='Enter user ID or @mention',
+            required=True
+        )
+        self.add_item(self.new_owner)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            new_owner_input = self.new_owner.value.strip()
+            
+            # Extract user ID from mention if provided
+            if new_owner_input.startswith('<@') and new_owner_input.endswith('>'):
+                new_owner_id = new_owner_input[2:-1]
+                if new_owner_id.startswith('!'):  # Handle nickname mentions
+                    new_owner_id = new_owner_id[1:]
+            else:
+                # Validate it's a numeric ID
+                if not new_owner_input.isdigit():
+                    await interaction.response.send_message("❌ Please provide a valid user ID or @mention", ephemeral=True)
+                    return
+                new_owner_id = new_owner_input
+
+            token, vps = bot.db.get_vps_by_id(self.vps_id)
+            if not vps or vps["created_by"] != str(interaction.user.id):
+                await interaction.response.send_message("❌ VPS not found or you don't have permission to transfer it!", ephemeral=True)
+                return
+
+            try:
+                old_owner = await bot.fetch_user(int(vps["created_by"]))
+                old_owner_name = old_owner.name
+            except:
+                old_owner_name = "Unknown User"
+
+            try:
+                new_owner = await bot.fetch_user(int(new_owner_id))
+                new_owner_name = new_owner.name
+                
+                # Check if new owner is banned
+                if bot.db.is_user_banned(new_owner.id):
+                    await interaction.response.send_message(f"❌ {new_owner.mention} is banned!", ephemeral=True)
+                    return
+
+                # Check if new owner already has max VPS
+                if bot.db.get_user_vps_count(new_owner.id) >= bot.db.get_setting('max_vps_per_user'):
+                    await interaction.response.send_message(f"❌ {new_owner.mention} already has the maximum number of VPS instances ({bot.db.get_setting('max_vps_per_user')})", ephemeral=True)
+                    return
+            except:
+                await interaction.response.send_message("❌ Invalid user ID or mention!", ephemeral=True)
+                return
+
+            bot.db.update_vps(token, {"created_by": str(new_owner.id)})
+
+            await interaction.response.send_message(f"✅ HostForge VPS {self.vps_id} has been transferred from {old_owner_name} to {new_owner_name}!", ephemeral=True)
+            
+            try:
+                embed = discord.Embed(title="HostForge VPS Transferred to You", color=discord.Color.green())
+                embed.add_field(name="VPS ID", value=self.vps_id, inline=True)
+                embed.add_field(name="Previous Owner", value=old_owner_name, inline=True)
+                embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
+                embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
+                embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
+                embed.add_field(name="Username", value="root", inline=True)
+                embed.add_field(name="Access Token", value=token, inline=False)
+                embed.add_field(name="SSH Password", value=f"||root||", inline=False)
+                embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
+                await new_owner.send(embed=embed)
+            except:
+                await interaction.followup.send("Note: Could not send DM to the new owner.", ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"Error in TransferVPSModal: {e}")
+            await interaction.response.send_message(f"❌ Error transferring VPS: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='manage_vps', description='Manage a VPS instance')
+@app_commands.describe(
+    vps_id="ID of the VPS to manage"
+)
+async def manage_vps(ctx, vps_id: str):
+    """Manage a VPS instance"""
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps or (vps["created_by"] != str(ctx.author.id) and not has_admin_role(ctx)):
+            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
+            return
+
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            container_status = container.status.capitalize()
+        except:
+            container_status = "Not Found"
+
+        status = vps['status'].capitalize()
+
+        embed = discord.Embed(title=f"HostForge VPS Management - {vps_id}", color=discord.Color.blue())
+        embed.add_field(name="Status", value=f"{status} (Container: {container_status})", inline=True)
+        embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
+        embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
+        embed.add_field(name="Disk Allocated", value=f"{vps['disk']}GB", inline=True)
+        embed.add_field(name="Username", value="root", inline=True)
+        embed.add_field(name="Created", value=vps['created_at'], inline=True)
+        embed.add_field(name="OS", value=vps.get('os_image', DEFAULT_OS_IMAGE), inline=True)
+        embed.add_field(name="Restart Count", value=vps.get('restart_count', 0), inline=True)
+        embed.add_field(name="SSH Port", value=vps['external_ssh_port'], inline=True)
+
+        view = VPSManagementView(vps_id, vps["container_id"])
+        
+        message = await ctx.send(embed=embed, view=view)
+        view.original_message = message
+    except Exception as e:
+        logger.error(f"Error in manage_vps: {e}")
+        await ctx.send(f"❌ Error managing VPS: {str(e)}", ephemeral=True)
+
+@bot.hybrid_command(name='transfer_vps', description='Transfer a VPS to another user')
+@app_commands.describe(
+    vps_id="ID of the VPS to transfer",
+    new_owner="User to transfer the VPS to"
+)
+async def transfer_vps_command(ctx, vps_id: str, new_owner: discord.Member):
+    """Transfer a VPS to another user"""
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps or vps["created_by"] != str(ctx.author.id):
+            await ctx.send("❌ VPS not found or you don't have permission to transfer it!", ephemeral=True)
+            return
+
+        if bot.db.is_user_banned(new_owner.id):
+            await ctx.send("❌ This user is banned!", ephemeral=True)
+            return
+
+        # Check if new owner already has max VPS
+        if bot.db.get_user_vps_count(new_owner.id) >= bot.db.get_setting('max_vps_per_user'):
+            await ctx.send(f"❌ {new_owner.mention} already has the maximum number of VPS instances ({bot.db.get_setting('max_vps_per_user')})", ephemeral=True)
+            return
+
+        bot.db.update_vps(token, {"created_by": str(new_owner.id)})
+
+        await ctx.send(f"✅ HostForge VPS {vps_id} has been transferred from {ctx.author.name} to {new_owner.name}!")
+
+        try:
+            embed = discord.Embed(title="HostForge VPS Transferred to You", color=discord.Color.green())
+            embed.add_field(name="VPS ID", value=vps_id, inline=True)
+            embed.add_field(name="Previous Owner", value=ctx.author.name, inline=True)
+            embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
+            embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
+            embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
+            embed.add_field(name="Username", value="root", inline=True)
+            embed.add_field(name="Access Token", value=token, inline=False)
+            embed.add_field(name="SSH Password", value=f"||root||", inline=False)
+            embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
+            await new_owner.send(embed=embed)
+        except:
+            await ctx.send("Note: Could not send DM to the new owner.", ephemeral=True)
+
+    except Exception as e:
+        logger.error(f"Error in transfer_vps_command: {e}")
+        await ctx.send(f"❌ Error transferring VPS: {str(e)}", ephemeral=True)
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("❌ You don't have permission to use this command!", ephemeral=True)
+    elif isinstance(error, commands.CommandNotFound):
+        await ctx.send("❌ Command not found! Use `/help` to see available commands.", ephemeral=True)
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Missing required argument: {error.param.name}", ephemeral=True)
+    else:
+        logger.error(f"Command error: {error}")
+        await ctx.send(f"❌ An error occurred: {str(error)}", ephemeral=True)
+
+# Run the bot
+if __name__ == "__main__":
+    try:
+        # Create directories if they don't exist
+        os.makedirs("temp_dockerfiles", exist_ok=True)
+        os.makedirs("migrations", exist_ok=True)
+        
+        bot.run(TOKEN)
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
+        traceback.print_exc()
