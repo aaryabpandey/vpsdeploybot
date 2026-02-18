@@ -1,4 +1,9 @@
-discord.py==2.4.0
-docker==7.1.0
-python-dotenv==1.0.1
 colorama==0.4.6
+discord.py
+python-dotenv
+aiohttp
+docker
+paramiko
+Flask
+Flask-SocketIO
+psutil
